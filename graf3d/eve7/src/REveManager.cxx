@@ -23,6 +23,7 @@
 #include <ROOT/REveSystem.hxx>
 #include <ROOT/RWebWindowsManager.hxx>
 #include <ROOT/REveGeoTopNode.hxx>
+#include <ROOT/REveText.hxx>
 
 #include "TGeoManager.h"
 #include "TGeoMatrix.h"
@@ -42,6 +43,8 @@
 #include "THttpServer.h"
 #include "TTimer.h"
 #include "TApplication.h"
+
+#include "REveAssetDir.hxx"
 
 #include <exception>
 #include <fstream>
@@ -204,6 +207,9 @@ REveManager::REveManager()
    fWebWindow->UseServerThreads();
    fWebWindow->SetDefaultPage("file:rootui5sys/eve7/index.html");
 
+   // Serve the SDF font and image directories, which can be set before the manager exists.
+   REX::Internal::REveAssetDir::RegisterAll();
+
    const char *gl_viewer = gEnv->GetValue("WebEve.GLViewer", "RCore");
    const char *gl_dblclick = gEnv->GetValue("WebEve.DblClick", "Off");
    Int_t htimeout = gEnv->GetValue("WebEve.HTimeout", 250);
@@ -221,6 +227,14 @@ REveManager::REveManager()
    fWebWindow->SetGeometry(900, 700); // configure predefined window geometry
    fWebWindow->SetConnLimit(100);     // maximal number of connections
    fWebWindow->SetMaxQueueLength(1000); // number of allowed entries in the window queue
+
+   // The hover tooltip of GL viewers is drawn with this SDF font. Asserting it
+   // also serves the sdf-fonts/ location, which otherwise only happens when an
+   // REveText or viewer axes are created.
+   {
+      std::string fn = "LiberationSerif-Regular";
+      REveText::AssertSdfFont(fn, std::string(TROOT::GetDataDir().Data()) + "/fonts/" + fn + ".ttf");
+   }
 
    fMIRExecThread = std::thread{[this] { MIRExecThread(); }};
 

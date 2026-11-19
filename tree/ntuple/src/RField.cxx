@@ -339,7 +339,7 @@ void ROOT::RField<double>::AcceptVisitor(ROOT::Detail::RFieldVisitor &visitor) c
 
 void ROOT::RField<double>::SetDouble32()
 {
-   fTypeAlias = "Double32_t";
+   SetTypeAlias("Double32_t");
 }
 
 //------------------------------------------------------------------------------
@@ -542,9 +542,9 @@ std::size_t ROOT::RField<std::string>::AppendImpl(const void *from)
 {
    auto typedValue = static_cast<const std::string *>(from);
    auto length = typedValue->length();
-   fAuxiliaryColumn->AppendV(typedValue->data(), length);
+   fAuxiliaryColumn->ForWriting()->AppendV(typedValue->data(), length);
    fIndex += length;
-   fPrincipalColumn->Append(&fIndex);
+   fPrincipalColumn->ForWriting()->Append(&fIndex);
    return length + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -553,12 +553,12 @@ void ROOT::RField<std::string>::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, v
    auto typedValue = static_cast<std::string *>(to);
    RNTupleLocalIndex collectionStart;
    ROOT::NTupleSize_t nChars;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nChars);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nChars);
    if (nChars == 0) {
       typedValue->clear();
    } else {
       typedValue->resize(nChars);
-      fAuxiliaryColumn->ReadV(collectionStart, nChars, const_cast<char *>(typedValue->data()));
+      fAuxiliaryColumn->ForReading()->ReadV(collectionStart, nChars, const_cast<char *>(typedValue->data()));
    }
 }
 
@@ -783,6 +783,9 @@ ROOT::RBitsetField::RBitsetField(std::string_view fieldName, std::size_t N)
                       false /* isSimple */, N),
      fN(N)
 {
+   if (N == 0) {
+      throw RException(R__FAIL("invalid zero-length bitset field " + GetQualifiedFieldName()));
+   }
    fTraits |= kTraitTriviallyDestructible;
 }
 
@@ -832,7 +835,7 @@ static void BitsetAppendImpl(const void *from, size_t nBits, ROOT::Internal::RCo
          buffer[b] =
             (asWordArray[currentBit / kBitsPerWord] & (static_cast<Word_t>(1) << (currentBit % kBitsPerWord))) != 0;
       }
-      column.AppendV(buffer, nBatch);
+      column.ForWriting()->AppendV(buffer, nBatch);
       bitIdx += nBatch;
    }
 }
@@ -856,7 +859,7 @@ BitsetReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to, size_t nBits, ROO
    std::size_t bitIdx = 0;
    while (bitIdx < nBits) {
       const std::size_t nBatch = std::min(kChunkSize, nBits - bitIdx);
-      column.ReadV(globalIndex * nBits + bitIdx, nBatch, buffer);
+      column.ForReading()->ReadV(globalIndex * nBits + bitIdx, nBatch, buffer);
       for (std::size_t b = 0; b < nBatch; ++b) {
          const std::size_t currentBit = bitIdx + b;
          const Word_t mask = static_cast<Word_t>(1) << (currentBit % kBitsPerWord);
@@ -884,8 +887,9 @@ BitsetReadInClusterImpl(ROOT::RNTupleLocalIndex localIndex, void *to, size_t nBi
    std::size_t bitIdx = 0;
    while (bitIdx < nBits) {
       const std::size_t nBatch = std::min(kChunkSize, nBits - bitIdx);
-      column.ReadV(ROOT::RNTupleLocalIndex(localIndex.GetClusterId(), localIndex.GetIndexInCluster() * nBits + bitIdx),
-                   nBatch, buffer);
+      column.ForReading()->ReadV(
+         ROOT::RNTupleLocalIndex(localIndex.GetClusterId(), localIndex.GetIndexInCluster() * nBits + bitIdx), nBatch,
+         buffer);
       for (std::size_t b = 0; b < nBatch; ++b) {
          const std::size_t currentBit = bitIdx + b;
          const Word_t mask = static_cast<Word_t>(1) << (currentBit % kBitsPerWord);
@@ -914,7 +918,7 @@ ROOT::RNullableField::RNullableField(std::string_view fieldName, const std::stri
                       false /* isSimple */)
 {
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = typePrefix + "<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias(typePrefix + "<" + itemField->GetTypeAlias() + ">");
 
    Attach(std::move(itemField), "_0");
 }
@@ -943,7 +947,7 @@ void ROOT::RNullableField::GenerateColumns(const ROOT::RNTupleDescriptor &desc)
 
 std::size_t ROOT::RNullableField::AppendNull()
 {
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return sizeof(ROOT::Internal::RColumnIndex);
 }
 
@@ -951,7 +955,7 @@ std::size_t ROOT::RNullableField::AppendValue(const void *from)
 {
    auto nbytesItem = CallAppendOn(*fSubfields[0], from);
    fNWritten++;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return sizeof(ROOT::Internal::RColumnIndex) + nbytesItem;
 }
 
@@ -975,7 +979,7 @@ ROOT::RNTupleLocalIndex ROOT::RNullableField::GetItemIndex(ROOT::NTupleSize_t gl
 {
    RNTupleLocalIndex collectionStart;
    ROOT::NTupleSize_t collectionSize;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &collectionSize);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &collectionSize);
    return (collectionSize == 0) ? RNTupleLocalIndex() : collectionStart;
 }
 
@@ -983,7 +987,7 @@ ROOT::RNTupleLocalIndex ROOT::RNullableField::GetItemIndex(ROOT::RNTupleLocalInd
 {
    RNTupleLocalIndex collectionStart;
    ROOT::NTupleSize_t collectionSize;
-   fPrincipalColumn->GetCollectionInfo(localIndex, &collectionStart, &collectionSize);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(localIndex, &collectionStart, &collectionSize);
    return (collectionSize == 0) ? RNTupleLocalIndex() : collectionStart;
 }
 
@@ -1004,6 +1008,7 @@ struct PolymorphicClass {
 ROOT::RUniquePtrField::RUniquePtrField(std::string_view fieldName, std::unique_ptr<RFieldBase> itemField)
    : RNullableField(fieldName, "std::unique_ptr", std::move(itemField)), fItemDeleter(GetDeleterOf(*fSubfields[0]))
 {
+   Internal::EnsureTypedChildField(*fSubfields[0], *this);
    if (const auto *classField = dynamic_cast<const ROOT::RClassField *>(fSubfields[0].get())) {
       fPolymorphicTypeInfo = classField->GetPolymorphicTypeInfo();
    }
@@ -1124,6 +1129,7 @@ std::vector<ROOT::RFieldBase::RValue> ROOT::RUniquePtrField::SplitValue(const RV
 ROOT::ROptionalField::ROptionalField(std::string_view fieldName, std::unique_ptr<RFieldBase> itemField)
    : RNullableField(fieldName, "std::optional", std::move(itemField)), fItemDeleter(GetDeleterOf(*fSubfields[0]))
 {
+   Internal::EnsureTypedChildField(*fSubfields[0], *this);
    if (fSubfields[0]->GetTraits() & kTraitTriviallyDestructible)
       fTraits |= kTraitTriviallyDestructible;
 }
@@ -1254,13 +1260,14 @@ ROOT::RAtomicField::RAtomicField(std::string_view fieldName, std::unique_ptr<RFi
    : RFieldBase(fieldName, "std::atomic<" + itemField->GetTypeName() + ">", ROOT::ENTupleStructure::kPlain,
                 false /* isSimple */)
 {
+   Internal::EnsureTypedChildField(*itemField, *this);
    if (itemField->GetTraits() & kTraitTriviallyConstructible)
       fTraits |= kTraitTriviallyConstructible;
    if (itemField->GetTraits() & kTraitTriviallyDestructible)
       fTraits |= kTraitTriviallyDestructible;
 
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = "std::atomic<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias("std::atomic<" + itemField->GetTypeAlias() + ">");
 
    Attach(std::move(itemField), "_0");
 }

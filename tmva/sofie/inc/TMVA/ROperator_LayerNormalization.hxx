@@ -86,8 +86,13 @@ public:
       fType = ConvertTypeToString(model.GetTensorType(fNX));
       // Size of the input
       fSize = fShapeX.size();
+      // Axis must be in [-size, size)
+      const int rank = static_cast<int>(fSize);
+      if (fAttrAxis < -rank || fAttrAxis >= rank)
+         throw std::runtime_error("TMVA::SOFIE - LayerNormalization - axis " + std::to_string(fAttrAxis) +
+                                  " is out of range for input of rank " + std::to_string(fSize));
       // Axis in [0, size)
-      fAxis = (fAttrAxis < 0) ? fSize + fAttrAxis : fAttrAxis;
+      fAxis = (fAttrAxis < 0) ? fAttrAxis + rank : fAttrAxis;
       // Shape of fShapeX[0, ..., fAxis)
       fAxesShape = std::vector<Dim>(fShapeX.begin(), fShapeX.begin() + fAxis);
       // Length of the axes
@@ -214,25 +219,37 @@ public:
       }
       if (scaleIndex.empty()) scaleIndex = "0";
 
-      auto biasStrides = UTILITY::ComputeStrideFromShape(fShapeB);
+      // the bias is optional: fShapeB is empty when there is no bias input
       std::string biasIndex;
-      for (size_t i = 0; i < fSize; i++) {
-         if (fShapeB[i].dim != 1) {
-            if (!biasIndex.empty()) biasIndex += " + ";
-            biasIndex += "axis_" + std::to_string(i);
-            if ( biasStrides[i].dim != 1) biasIndex +=  " * " + biasStrides[i].GetVal();
+      if (!fNB.empty()) {
+         auto biasStrides = UTILITY::ComputeStrideFromShape(fShapeB);
+         for (size_t i = 0; i < fSize; i++) {
+            if (fShapeB[i].dim != 1) {
+               if (!biasIndex.empty()) biasIndex += " + ";
+               biasIndex += "axis_" + std::to_string(i);
+               if ( biasStrides[i].dim != 1) biasIndex +=  " * " + biasStrides[i].GetVal();
+            }
          }
       }
       if (biasIndex.empty()) biasIndex = "0";
 
-      auto axesStrides = UTILITY::ComputeStrideFromShape(fAxesShape);
-      std::string axesIndex = "axis_" + std::to_string(0) + " * " + axesStrides[0].GetVal();
-      for (size_t i = 1; i < fAxis; i++) {
-         axesIndex += " + axis_" + std::to_string(i) + " * " + axesStrides[i].GetVal();
+      // index in the Mean and InvStdDev tensors. If fAxis is 0 there are no outer
+      // dimensions and these tensors have a single element
+      std::string axesIndex = "0";
+      if (fAxis > 0) {
+         auto axesStrides = UTILITY::ComputeStrideFromShape(fAxesShape);
+         axesIndex = "axis_0 * " + axesStrides[0].GetVal();
+         for (size_t i = 1; i < fAxis; i++) {
+            axesIndex += " + axis_" + std::to_string(i) + " * " + axesStrides[i].GetVal();
+         }
       }
 
 
       // compute mean and std-dev. Save in tensors if requested
+
+      // open a scope: if fAxis is 0 there are no outer loops and the local
+      // variables below would otherwise be declared at function scope
+      out << SP << "{\n";
 
       out << SP << "// Compute the mean\n";
 
@@ -307,6 +324,7 @@ public:
       for (size_t i = 0; i < fAxis; i++) {
          out << SP << "}\n";
       }
+      out << SP << "}\n";
 
       return out.str();
    }

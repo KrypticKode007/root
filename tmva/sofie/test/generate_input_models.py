@@ -853,6 +853,30 @@ def make_ConvTransposeBias2dBatched():
     return _model(graph, opset=17, ir_version=8)
 
 
+def make_ConvTransposeGroup2d():
+    """Ops: ConvTranspose with group=2 (regression test for per-group channel counts)"""
+    nodes = [
+        helper.make_node('ConvTranspose', ['X', 'W', 'B'], ['Y'], group=2),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        'ConvTransposeGroup2d',
+        inputs=[
+            _vi('X', FLOAT, [2, 4, 3, 3]),
+            _vi('W', FLOAT, [4, 3, 2, 2]),
+            _vi('B', FLOAT, [6]),
+        ],
+        outputs=[
+            _vi('Y', FLOAT, [2, 6, 4, 4]),
+        ],
+        initializer=[
+            _random_tensor('W', [4, 3, 2, 2], 101),
+            _tensor('B', FLOAT, [6], [0.5, -0.5, 1.0, -1.0, 2.0, -2.0]),
+        ],
+    )
+    return _model(graph, opset=17, ir_version=8)
+
+
 def make_ConvWithAsymmetricPadding():
     """Ops: Conv"""
     nodes = [
@@ -2526,6 +2550,32 @@ def make_LayerNormalization4d():
     return _model(graph, opset=17, ir_version=8)
 
 
+def make_LayerNormalizationAxis0():
+    """Ops: LayerNormalization with axis=0 and axis=-rank, with Mean and InvStdDev outputs"""
+    nodes = [
+        helper.make_node('LayerNormalization', ['X', 'Scale', 'B'], ['Y0', 'Mean', 'InvStdDev'], axis=0),
+        helper.make_node('LayerNormalization', ['Y0', 'Scale2'], ['Y'], axis=-2),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        'LayerNormalizationAxis0',
+        inputs=[
+            _vi('X', FLOAT, [2, 3]),
+        ],
+        outputs=[
+            _vi('Y', FLOAT, [2, 3]),
+            _vi('Mean', FLOAT, [1, 1]),
+            _vi('InvStdDev', FLOAT, [1, 1]),
+        ],
+        initializer=[
+            _tensor('Scale', FLOAT, [2, 3], [0.5, -0.25, 1.0, 2.0, 0.75, -1.5]),
+            _tensor('B', FLOAT, [2, 3], [0.125, -0.5, 0.25, 0.0, 1.0, -0.75]),
+            _tensor('Scale2', FLOAT, [3], [1.5, -0.5, 0.25]),
+        ],
+    )
+    return _model(graph, opset=17, ir_version=8)
+
+
 def make_Less():
     """Ops: Less"""
     nodes = [
@@ -2591,6 +2641,30 @@ def make_LinearWithLeakyRelu():
         ],
     )
     return _model(graph, opset=9, ir_version=4, producer_name='pytorch', producer_version='1.11.0')
+
+
+def make_ThresholdedRelu():
+    """Ops: ThresholdedRelu"""
+    nodes = [
+        helper.make_node(
+            "ThresholdedRelu",
+            ["input"],
+            ["1"],
+            name="ThresholdedRelu_0",
+            alpha=1.0,
+        ),
+    ]
+    graph = helper.make_graph(
+        nodes,
+        "torch-jit-export",
+        inputs=[
+            _vi("input", FLOAT, [8]),
+        ],
+        outputs=[
+            _vi("1", FLOAT, [8]),
+        ],
+    )
+    return _model(graph, opset=10, ir_version=6, producer_name="pytorch", producer_version="1.11.0")
 
 
 def make_LinearWithSelu():
@@ -6227,6 +6301,43 @@ def make_AliasDynShapeAcrossNewTensor():
     return _model(graph, opset=13, ir_version=10, producer_name="onnx-example")
 
 
+def _unsqueeze_model(name, opset, axes_as_attr, axes):
+    """x of shape [3] is unsqueezed to [1, 3, 1] and added to a [3, 1, 1] tensor.
+    The broadcast makes the result [3, 3, 1] with out[i, j] = w[i] + x[j], so
+    that any other placement of the new axes gives a different result."""
+    if axes_as_attr:
+        unsqueeze = helper.make_node("Unsqueeze", ["x"], ["xu"], name="unsqueeze_0", axes=axes)
+        initializer = []
+    else:
+        unsqueeze = helper.make_node("Unsqueeze", ["x", "axes"], ["xu"], name="unsqueeze_0")
+        initializer = [_tensor("axes", INT64, [len(axes)], axes)]
+    initializer.append(_tensor("w", FLOAT, [3, 1, 1], [10.0, 20.0, 30.0]))
+    graph = helper.make_graph(
+        [unsqueeze, helper.make_node("Add", ["xu", "w"], ["out"], name="add_0")],
+        name,
+        inputs=[_vi("x", FLOAT, [3])],
+        outputs=[_vi("out", FLOAT, [3, 3, 1])],
+        initializer=initializer,
+    )
+    return _model(graph, opset=opset, ir_version=10, producer_name="onnx-example")
+
+
+def make_UnsqueezeUnsortedAxes():
+    """Ops: Unsqueeze, Add. The axes refer to positions in the output and are
+    not in increasing order."""
+    return _unsqueeze_model("unsqueeze_unsorted_axes", 13, False, [2, 0])
+
+
+def make_UnsqueezeNegativeAxes():
+    """Ops: Unsqueeze, Add. Negative axes count from the end of the output."""
+    return _unsqueeze_model("unsqueeze_negative_axes", 13, False, [-1, 0])
+
+
+def make_UnsqueezeAxesAttribute():
+    """Ops: Unsqueeze, Add. Axes given as an attribute (opset 11), unsorted."""
+    return _unsqueeze_model("unsqueeze_axes_attribute", 11, True, [2, 0])
+
+
 MODELS = {
     "Abs": make_Abs,
     "Acosh": make_Acosh,
@@ -6268,6 +6379,7 @@ MODELS = {
     "ConvTranspose2dOutputShape": make_ConvTranspose2dOutputShape,
     "ConvTransposeBias2d": make_ConvTransposeBias2d,
     "ConvTransposeBias2dBatched": make_ConvTransposeBias2dBatched,
+    "ConvTransposeGroup2d": make_ConvTransposeGroup2d,
     "ConvWithAsymmetricPadding": make_ConvWithAsymmetricPadding,
     "ConvSameUpperEvenKernel": make_ConvSameUpperEvenKernel,
     "ConvSameLowerEvenKernel": make_ConvSameLowerEvenKernel,
@@ -6338,6 +6450,9 @@ MODELS = {
     "AliasAcrossNewTensor": make_AliasAcrossNewTensor,
     "AliasChain": make_AliasChain,
     "AliasChainSingle": make_AliasChainSingle,
+    "UnsqueezeUnsortedAxes": make_UnsqueezeUnsortedAxes,
+    "UnsqueezeNegativeAxes": make_UnsqueezeNegativeAxes,
+    "UnsqueezeAxesAttribute": make_UnsqueezeAxesAttribute,
     "AliasDynShape": make_AliasDynShape,
     "AliasDynShapeAcrossNewTensor": make_AliasDynShapeAcrossNewTensor,
     "AliasOwnerReadAfterAlias": make_AliasOwnerReadAfterAlias,
@@ -6345,9 +6460,11 @@ MODELS = {
     "IdentityAlias": make_IdentityAlias,
     "LayerNormalization2d": make_LayerNormalization2d,
     "LayerNormalization4d": make_LayerNormalization4d,
+    "LayerNormalizationAxis0": make_LayerNormalizationAxis0,
     "Less": make_Less,
     "LessOrEqual": make_LessOrEqual,
     "LinearWithLeakyRelu": make_LinearWithLeakyRelu,
+    "ThresholdedRelu": make_ThresholdedRelu,
     "LinearWithSelu": make_LinearWithSelu,
     "LinearWithSigmoid": make_LinearWithSigmoid,
     "Linear_16": make_Linear_16,
@@ -7084,6 +7201,7 @@ TEST_INPUTS = {
     "ConvTranspose2dOutputShape": [f32(np.arange(0.0, 9.0), (1, 1, 3, 3))],
     "ConvTransposeBias2d": [f32(np.arange(0.0, 9.0), (1, 1, 3, 3))],
     "ConvTransposeBias2dBatched": [f32(np.arange(0.0, 18.0), (2, 1, 3, 3))],
+    "ConvTransposeGroup2d": [rand_f32(34, (2, 4, 3, 3))],
     "ConvTransposeSharedInput": [rand_f32(33, (1, 2, 3, 3))],
     "ConvWithAsymmetricPadding": [f32(np.arange(0.0, 35.0), (1, 1, 7, 5))],
     "ConvSameUpperEvenKernel": [f32(np.arange(0.0, 16.0), (1, 1, 4, 4))],
@@ -7179,6 +7297,9 @@ TEST_INPUTS = {
     "AliasAcrossNewTensor": [rand_f32(45, (2, 3)), rand_f32(46, (3, 2))],
     "AliasChain": [rand_f32(47, (1, 2, 3))],
     "AliasChainSingle": [rand_f32(47, (1, 2, 3))],
+    "UnsqueezeUnsortedAxes": [f32([1.0, 2.0, 3.0], (3,))],
+    "UnsqueezeNegativeAxes": [f32([1.0, 2.0, 3.0], (3,))],
+    "UnsqueezeAxesAttribute": [f32([1.0, 2.0, 3.0], (3,))],
     "AliasDynShape": [rand_f32(48, (2, 3))],
     "AliasDynShapeAcrossNewTensor": [rand_f32(51, (2, 3)), rand_f32(52, (2, 3))],
     "AliasOwnerReadAfterAlias": [rand_f32(49, (2, 3)), rand_f32(50, (2, 3))],
@@ -7234,6 +7355,7 @@ TEST_INPUTS = {
     "LSTMPeepholes": [f32(np.arange(1.0, 9.0), (1, 2, 4))],
     "LayerNormalization2d": [f32(np.arange(0.0, 12.0), (3, 4))],
     "LayerNormalization4d": [f32(np.arange(0.0, 120.0), (2, 3, 4, 5))],
+    "LayerNormalizationAxis0": [f32([0.5, -1.0, 2.0, 3.5, -0.25, 1.0], (2, 3))],
     "Less": [
         f32([1.0, 2.0, 3.0], (3,)),
         f32([4.0, 2.0, 6.0], (3,)),
@@ -7275,6 +7397,7 @@ TEST_INPUTS = {
             (24,),
         )
     ],
+    "ThresholdedRelu": [f32([-2.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0, 3.5], (8,))],
     "LinearWithSelu": [f32(np.full(48, 1.0), (2, 24))],
     "LinearWithSigmoid": [f32(np.full(48, 1.0), (2, 24))],
     "Linear_16": [f32(np.full(1600, 1.0), (16, 100))],
@@ -8099,6 +8222,30 @@ def _convtranspose_outputshape_reference(model, feeds):
 
 
 # Models whose expected outputs the ReferenceEvaluator cannot compute.
+def _convtranspose_group_reference(model, feeds):
+    """Grouped ConvTranspose computed directly (stride 1, no padding, no dilation);"""
+    from onnx import numpy_helper
+
+    init = {t.name: numpy_helper.to_array(t) for t in model.graph.initializer}
+    node = model.graph.node[0]
+    group = [a.i for a in node.attribute if a.name == "group"][0]
+    x, w, b = feeds["X"], init["W"], init["B"]
+    n, cin, h, wd = x.shape
+    _, cout_g, kh, kw = w.shape
+    cin_g = cin // group
+    y = np.zeros((n, cout_g * group, h + kh - 1, wd + kw - 1), dtype=np.float64)
+    for g in range(group):
+        for ic in range(cin_g):
+            for oc in range(cout_g):
+                for i in range(h):
+                    for j in range(wd):
+                        y[:, g * cout_g + oc, i:i + kh, j:j + kw] += (
+                            x[:, g * cin_g + ic, i, j][:, None, None] * w[g * cin_g + ic, oc]
+                        )
+    y += b.reshape(1, -1, 1, 1)
+    return [y.astype(np.float32)]
+
+
 def _batchnorm_reference(model, feeds):
     """Inference-mode batch normalization, computed directly.
 
@@ -8127,6 +8274,20 @@ def _batchnorm_reference(model, feeds):
     return [y.astype(np.float32)]
 
 
+def _unsqueeze_reference(model, feeds):
+    """Unsqueeze with all the axes at once, as the ONNX specification says. The
+    ReferenceEvaluator applies them one after the other, which fails for axes
+    that are not in increasing order."""
+    node = next(n for n in model.graph.node if n.op_type == "Unsqueeze")
+    if len(node.input) > 1:
+        axes = next(numpy_helper.to_array(t) for t in model.graph.initializer if t.name == node.input[1])
+    else:
+        axes = next(a.ints for a in node.attribute if a.name == "axes")
+    w = next(numpy_helper.to_array(t) for t in model.graph.initializer if t.name == "w")
+    xu = np.expand_dims(feeds[node.input[0]], tuple(int(a) for a in axes))
+    return [xu + w]
+
+
 def _logsoftmax_reference(model, feeds):
     """LogSoftmax computed as (x - max) - log(sum(exp(x - max))).
 
@@ -8151,11 +8312,15 @@ EXPECTED_OVERRIDES = {
     "MaxPool2d_AsymPad": _maxpool2d_reference,
     "MeanMultidirectionalBroadcast": _mean_reference,
     "ConvTranspose2dOutputShape": _convtranspose_outputshape_reference,
+    "ConvTransposeGroup2d": _convtranspose_group_reference,
     "IdentityWeightBatchNorm": _batchnorm_reference,
     "BatchNormEpsilon": _batchnorm_reference,
     "BatchNormReluEpsilon": _batchnorm_reference,
     "LogSoftmaxLargeRange": _logsoftmax_reference,
     "LogSoftmaxLargeRangeAxis0": _logsoftmax_reference,
+    "UnsqueezeUnsortedAxes": _unsqueeze_reference,
+    "UnsqueezeNegativeAxes": _unsqueeze_reference,
+    "UnsqueezeAxesAttribute": _unsqueeze_reference,
 }
 
 

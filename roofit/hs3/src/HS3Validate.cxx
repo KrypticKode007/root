@@ -45,6 +45,7 @@ public:
       checkLikelihoods();
       checkAnalyses();
       checkData();
+      checkCombinedData();
       for (std::size_t i = 0; i < _doc.distributions.size(); ++i) {
          auto const &dist = _doc.distributions[i];
          if (auto const *histFactory = std::get_if<HistFactoryDist>(&dist.body)) {
@@ -130,6 +131,7 @@ private:
    void checkLikelihoods();
    void checkAnalyses();
    void checkData();
+   void checkCombinedData();
 
    HS3Document const &_doc;
    Diagnostics &_diagnostics;
@@ -182,7 +184,7 @@ void Validator::collectNames()
    // HistFactory modifiers, which are created on the fly.
    for (auto const &domain : _doc.domains) {
       for (auto const &axis : domain.axes) {
-         addParameter(std::visit([](auto const &a) -> std::string const & { return a.name; }, axis));
+         addParameter(nameOf(axis));
       }
    }
    for (auto const &point : _doc.parameterPoints) {
@@ -239,8 +241,7 @@ void Validator::checkFixedAxes()
       for (std::size_t i = 0; i < _doc.domains.size(); ++i) {
          for (auto const &axis : _doc.domains[i].axes) {
             // A categorical axis is passed as null.
-            fn(i, std::visit([](auto const &a) -> std::string const & { return a.name; }, axis),
-               std::get_if<DomainAxis>(&axis));
+            fn(i, nameOf(axis), std::get_if<DomainAxis>(&axis));
          }
       }
    };
@@ -324,6 +325,74 @@ void Validator::checkCategoricalAxes()
          if (found != categorical.end()) {
             error(at("domains", i, domain.name),
                   "the axis '" + continuous->name + "' is listed in a domain as categorical and as continuous");
+         }
+      }
+   }
+}
+
+// The columns of combined data sets are categorical axes of the domains, or categories that exist already, and the keys
+// consist of their categories. Every sub-data set is a data set of the document that belongs to one combined data set.
+void Validator::checkCombinedData()
+{
+   std::map<std::string, std::vector<std::string> const *> categorical;
+   for (Domain const &domain : _doc.domains) {
+      for (auto const &axis : domain.axes) {
+         if (auto const *cat = std::get_if<CategoricalAxis>(&axis)) {
+            categorical.emplace(cat->name, &cat->categories);
+         }
+      }
+   }
+   std::set<std::string> combinedNames;
+   for (auto const &data : _doc.data) {
+      if (std::holds_alternative<CombinedData>(data.body)) {
+         combinedNames.insert(data.name);
+      }
+   }
+   std::set<std::string> usedComponents;
+   for (std::size_t i = 0; i < _doc.data.size(); ++i) {
+      auto const *combined = std::get_if<CombinedData>(&_doc.data[i].body);
+      if (!combined) {
+         continue;
+      }
+      std::string const path = at("data", i, _doc.data[i].name);
+      std::string const context = "the combined data set '" + _doc.data[i].name + "'";
+      std::vector<std::vector<std::string> const *> columnCategories;
+      std::set<std::string> columns;
+      for (std::string const &column : combined->columns) {
+         auto found = categorical.find(column);
+         if (found == categorical.end() && !isExternal(column)) {
+            error(path,
+                  "the column '" + column + "' of " + context + " is not declared by a categorical axis of a domain");
+            return;
+         }
+         if (!columns.insert(column).second) {
+            error(path, "the column '" + column + "' of " + context + " is listed twice");
+            return;
+         }
+         columnCategories.push_back(found != categorical.end() ? found->second : nullptr);
+      }
+      std::set<std::vector<std::string>> keys;
+      for (CombinedDataComponent const &component : combined->components) {
+         for (std::size_t k = 0; k < component.key.size(); ++k) {
+            auto const *categories = columnCategories[k];
+            if (categories &&
+                std::find(categories->begin(), categories->end(), component.key[k]) == categories->end()) {
+               error(path, "the label '" + component.key[k] + "' in position " + std::to_string(k) + " of a key of " +
+                              context + " is not one of the categories of '" + combined->columns[k] + "'");
+            }
+         }
+         if (!keys.insert(component.key).second) {
+            std::string key = "[";
+            for (std::size_t k = 0; k < component.key.size(); ++k) {
+               key += (k == 0 ? "\"" : ", \"") + component.key[k] + "\"";
+            }
+            error(path, "the key " + key + "] is used by two components of " + context);
+         }
+         std::string const &name = component.data.name;
+         if (!isDefinedIn(name, "data") || combinedNames.count(name) || !usedComponents.insert(name).second) {
+            error(path, "the component '" + name + "' of " + context +
+                           " is not a data set of the document, or it is already a component of another combined "
+                           "data set");
          }
       }
    }
@@ -530,6 +599,27 @@ void Validator::checkHistFactory(HistFactoryDist const &dist, std::string const 
 
    checkGammaConstraint(path + ".staterror", dist.statError.constraint);
 
+   // The staterror modifiers of all samples share the gamma parameters, so the ones that name constraints must name
+   // the same.
+   GammaConstraintPdfs const *statErrorConstraints = nullptr;
+   auto checkStatErrorConstraints = [&](std::string const &where, GammaConstraint const &constraint) {
+      auto const *pdfs = std::get_if<GammaConstraintPdfs>(&constraint);
+      if (!pdfs) {
+         return;
+      }
+      if (!statErrorConstraints) {
+         statErrorConstraints = pdfs;
+         return;
+      }
+      auto const &first = statErrorConstraints->pdfs;
+      const bool same = std::equal(first.begin(), first.end(), pdfs->pdfs.begin(), pdfs->pdfs.end(),
+                                   [](auto const &l, auto const &r) { return l && r ? l->name == r->name : !l && !r; });
+      if (!same) {
+         error(where,
+               "the staterror modifiers of the samples of channel '" + channelName + "' name different constraints");
+      }
+   };
+
    std::set<std::string> sampleNames;
    for (std::size_t iSample = 0; iSample < dist.samples.size(); ++iSample) {
       auto const &sample = dist.samples[iSample];
@@ -552,7 +642,9 @@ void Validator::checkHistFactory(HistFactoryDist const &dist, std::string const 
                                         ", contents=" + std::to_string(sample.contents.size()));
       }
       for (std::size_t iModifier = 0; iModifier < sample.modifiers.size(); ++iModifier) {
-         std::string modifierPath = samplePath + ".modifiers[" + std::to_string(iModifier) + "]";
+         Modifier const &modifier = sample.modifiers[iModifier];
+         const std::string modifierPath =
+            samplePath + ".modifiers[" + std::to_string(iModifier) + "](" + nameOf(modifier) + ")";
          auto checkInterpolation = [&](std::optional<Interpolation> const &interpolation, char const *type,
                                        std::string const &modifierName) {
             if (!interpolation && !dist.defaultInterpolation) {
@@ -561,32 +653,26 @@ void Validator::checkHistFactory(HistFactoryDist const &dist, std::string const 
                                       "' is not given, and the channel has no \"default_interpolation\"");
             }
          };
+         // The modifiers with a single parameter, which can have a constraint.
+         auto checkSingleParameter = [&](auto const &m) {
+            checkParameter(modifierPath, m.parameter.name, m.name);
+            checkConstraint(modifierPath, m.constraint);
+            checkCorrelated(modifierPath, m.parameter.name, m.constraint);
+         };
          std::visit(overloaded{
-                       [&](NormFactor const &m) {
-                          modifierPath += "(" + m.name + ")";
-                          checkParameter(modifierPath, m.parameter.name, m.name);
-                          checkConstraint(modifierPath, m.constraint);
-                          checkCorrelated(modifierPath, m.parameter.name, m.constraint);
-                       },
+                       [&](NormFactor const &m) { checkSingleParameter(m); },
                        [&](NormSys const &m) {
-                          modifierPath += "(" + m.name + ")";
-                          checkParameter(modifierPath, m.parameter.name, m.name);
-                          checkConstraint(modifierPath, m.constraint);
-                          checkCorrelated(modifierPath, m.parameter.name, m.constraint);
+                          checkSingleParameter(m);
                           checkInterpolation(m.interpolation, "normsys", m.name);
                        },
                        [&](HistoSys const &m) {
-                          modifierPath += "(" + m.name + ")";
                           checkUniqueName(modifierPath, "histosys", m.name);
-                          checkParameter(modifierPath, m.parameter.name, m.name);
-                          checkConstraint(modifierPath, m.constraint);
-                          checkCorrelated(modifierPath, m.parameter.name, m.constraint);
+                          checkSingleParameter(m);
                           checkInterpolation(m.interpolation, "histosys", m.name);
                           checkSize(modifierPath + ".data.hi.contents", m.hi.contents.size(), "\"contents\"");
                           checkSize(modifierPath + ".data.lo.contents", m.lo.contents.size(), "\"contents\"");
                        },
                        [&](ShapeSys const &m) {
-                          modifierPath += "(" + m.name + ")";
                           checkUniqueName(modifierPath, "shapesys", m.name);
                           if (!m.vals.empty()) {
                              checkSize(modifierPath + ".data.vals", m.vals.size(), "\"vals\"");
@@ -600,21 +686,20 @@ void Validator::checkHistFactory(HistFactoryDist const &dist, std::string const 
                           checkGammaConstraint(modifierPath, m.constraint);
                        },
                        [&](StatError const &m) {
-                          modifierPath += "(" + m.name + ")";
                           if (!m.parameters.empty()) {
                              checkSize(modifierPath + ".parameters", m.parameters.size(), "\"parameters\"");
                           }
                           checkGammaConstraint(modifierPath, m.constraint);
+                          checkStatErrorConstraints(modifierPath, m.constraint);
                        },
                        [&](CustomModifier const &m) {
-                          modifierPath += "(" + m.name + ")";
                           if (!isDefinedIn(m.name, "functions") && !isDefinedIn(m.name, "distributions") &&
                               !isExternal(m.name)) {
                              error(modifierPath, "unable to find custom modifier '" + m.name + "'");
                           }
                        },
                     },
-                    sample.modifiers[iModifier]);
+                    modifier);
       }
    }
 }

@@ -73,10 +73,14 @@ ROOT::RArrayField::RArrayField(std::string_view fieldName, std::unique_ptr<RFiel
      fItemSize(itemField->GetValueSize()),
      fArrayLength(arrayLength)
 {
+   Internal::EnsureTypedChildField(*itemField, *this);
+   if (arrayLength == 0) {
+      throw RException(R__FAIL("invalid zero-length array field " + GetQualifiedFieldName()));
+   }
    fTraits |= itemField->GetTraits() & ~kTraitMappable;
    if (!itemField->GetTypeAlias().empty()) {
-      fTypeAlias = "std::array<" + itemField->GetTypeAlias() + "," +
-                   Internal::GetNormalizedInteger(static_cast<unsigned long long>(arrayLength)) + ">";
+      SetTypeAlias("std::array<" + itemField->GetTypeAlias() + "," +
+                   Internal::GetNormalizedInteger(static_cast<unsigned long long>(arrayLength)) + ">");
    }
    Attach(std::move(itemField), "_0");
 }
@@ -91,7 +95,7 @@ std::size_t ROOT::RArrayField::AppendImpl(const void *from)
 {
    std::size_t nbytes = 0;
    if (fSubfields[0]->IsSimple()) {
-      GetPrincipalColumnOf(*fSubfields[0])->AppendV(from, fArrayLength);
+      GetPrincipalColumnOf(*fSubfields[0])->ForWriting()->AppendV(from, fArrayLength);
       nbytes += fArrayLength * GetPrincipalColumnOf(*fSubfields[0])->GetElement()->GetPackedSize();
    } else {
       auto arrayPtr = static_cast<const unsigned char *>(from);
@@ -105,7 +109,7 @@ std::size_t ROOT::RArrayField::AppendImpl(const void *from)
 void ROOT::RArrayField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to)
 {
    if (fSubfields[0]->IsSimple()) {
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(globalIndex * fArrayLength, fArrayLength, to);
+      GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(globalIndex * fArrayLength, fArrayLength, to);
    } else {
       auto arrayPtr = static_cast<unsigned char *>(to);
       for (unsigned i = 0; i < fArrayLength; ++i) {
@@ -117,7 +121,7 @@ void ROOT::RArrayField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to)
 void ROOT::RArrayField::ReadInClusterImpl(RNTupleLocalIndex localIndex, void *to)
 {
    if (fSubfields[0]->IsSimple()) {
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(localIndex * fArrayLength, fArrayLength, to);
+      GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(localIndex * fArrayLength, fArrayLength, to);
    } else {
       auto arrayPtr = static_cast<unsigned char *>(to);
       for (unsigned i = 0; i < fArrayLength; ++i) {
@@ -132,6 +136,7 @@ std::size_t ROOT::RArrayField::ReadBulkImpl(const RBulkSpec &bulkSpec)
       return RFieldBase::ReadBulkImpl(bulkSpec);
 
    GetPrincipalColumnOf(*fSubfields[0])
+      ->ForReading()
       ->ReadV(bulkSpec.fFirstIndex * fArrayLength, bulkSpec.fCount * fArrayLength, bulkSpec.fValues);
    return RBulkSpec::kAllSet;
 }
@@ -197,6 +202,7 @@ ROOT::RRVecField::RRVecField(std::string_view fieldName, std::unique_ptr<RFieldB
      fItemSize(itemField->GetValueSize()),
      fNWritten(0)
 {
+   Internal::EnsureTypedChildField(*itemField, *this);
    if (itemField->GetAlignment() > sizeof(std::max_align_t)) {
       // RVec uses operator new without alignment info
       throw RException(R__FAIL("RVec does not support over-aligned types"));
@@ -205,7 +211,7 @@ ROOT::RRVecField::RRVecField(std::string_view fieldName, std::unique_ptr<RFieldB
    if (!(itemField->GetTraits() & kTraitTriviallyDestructible))
       fItemDeleter = GetDeleterOf(*itemField);
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = "ROOT::VecOps::RVec<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias("ROOT::VecOps::RVec<" + itemField->GetTypeAlias() + ">");
    Attach(std::move(itemField), "_0");
    fValueSize =
       Internal::EvalRVecValueSize(fSubfields[0]->GetAlignment(), fSubfields[0]->GetValueSize(), GetAlignment());
@@ -236,7 +242,7 @@ std::size_t ROOT::RRVecField::AppendImpl(const void *from)
 
    std::size_t nbytes = 0;
    if (fSubfields[0]->IsSimple() && *sizePtr) {
-      GetPrincipalColumnOf(*fSubfields[0])->AppendV(*beginPtr, *sizePtr);
+      GetPrincipalColumnOf(*fSubfields[0])->ForWriting()->AppendV(*beginPtr, *sizePtr);
       nbytes += *sizePtr * GetPrincipalColumnOf(*fSubfields[0])->GetElement()->GetPackedSize();
    } else {
       for (std::int32_t i = 0; i < *sizePtr; ++i) {
@@ -245,7 +251,7 @@ std::size_t ROOT::RRVecField::AppendImpl(const void *from)
    }
 
    fNWritten += *sizePtr;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return nbytes + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -346,12 +352,12 @@ void ROOT::RRVecField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to)
    // Read collection info for this entry
    ROOT::NTupleSize_t nItems;
    RNTupleLocalIndex collectionStart;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
 
    auto begin = ResizeRVec(to, nItems, fItemSize, fSubfields[0].get(), fItemDeleter.get());
 
    if (fSubfields[0]->IsSimple() && nItems) {
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(collectionStart, nItems, begin);
+      GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(collectionStart, nItems, begin);
       return;
    }
 
@@ -379,7 +385,7 @@ std::size_t ROOT::RRVecField::ReadBulkImpl(const RBulkSpec &bulkSpec)
    // Get size of the first RVec of the bulk
    RNTupleLocalIndex firstItemIndex;
    ROOT::NTupleSize_t collectionSize;
-   fPrincipalColumn->GetCollectionInfo(bulkSpec.fFirstIndex, &firstItemIndex, &collectionSize);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(bulkSpec.fFirstIndex, &firstItemIndex, &collectionSize);
    *beginPtr = itemValueArray;
    *sizePtr = collectionSize;
    *capacityPtr = -1;
@@ -393,8 +399,8 @@ std::size_t ROOT::RRVecField::ReadBulkImpl(const RBulkSpec &bulkSpec)
    std::size_t nItems = collectionSize;
    while (nRemainingValues > 0) {
       ROOT::NTupleSize_t nElementsUntilPageEnd;
-      const auto offsets =
-         fPrincipalColumn->MapV<ROOT::Internal::RColumnIndex>(bulkSpec.fFirstIndex + nValues, nElementsUntilPageEnd);
+      const auto offsets = fPrincipalColumn->ForReading()->MapV<ROOT::Internal::RColumnIndex>(
+         bulkSpec.fFirstIndex + nValues, nElementsUntilPageEnd);
       const std::size_t nBatch = std::min(nRemainingValues, nElementsUntilPageEnd);
       for (std::size_t i = 0; i < nBatch; ++i) {
          const auto size = offsets[i] - lastOffset;
@@ -423,6 +429,7 @@ std::size_t ROOT::RRVecField::ReadBulkImpl(const RBulkSpec &bulkSpec)
    }
 
    GetPrincipalColumnOf(*fBulkSubfield)
+      ->ForReading()
       ->ReadV(firstItemIndex * fBulkNRepetition, nItems * fBulkNRepetition, itemValueArray - delta);
    return RBulkSpec::kAllSet;
 }
@@ -550,7 +557,7 @@ ROOT::RVectorField::RVectorField(std::string_view fieldName, std::unique_ptr<RFi
    }
 
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = "std::vector<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias("std::vector<" + itemField->GetTypeAlias() + ">");
 
    if (!(itemField->GetTraits() & kTraitTriviallyDestructible))
       fItemDeleter = GetDeleterOf(*itemField);
@@ -560,6 +567,7 @@ ROOT::RVectorField::RVectorField(std::string_view fieldName, std::unique_ptr<RFi
 ROOT::RVectorField::RVectorField(std::string_view fieldName, std::unique_ptr<RFieldBase> itemField)
    : RVectorField(fieldName, std::move(itemField), nullptr)
 {
+   Internal::EnsureTypedChildField(*fSubfields[0], *this);
 }
 
 std::unique_ptr<ROOT::RVectorField>
@@ -602,7 +610,7 @@ std::size_t ROOT::RVectorField::AppendImpl(const void *from)
    std::size_t nbytes = 0;
 
    if (fSubfields[0]->IsSimple() && count) {
-      GetPrincipalColumnOf(*fSubfields[0])->AppendV(typedValue->data(), count);
+      GetPrincipalColumnOf(*fSubfields[0])->ForWriting()->AppendV(typedValue->data(), count);
       nbytes += count * GetPrincipalColumnOf(*fSubfields[0])->GetElement()->GetPackedSize();
    } else {
       for (unsigned i = 0; i < count; ++i) {
@@ -611,7 +619,7 @@ std::size_t ROOT::RVectorField::AppendImpl(const void *from)
    }
 
    fNWritten += count;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return nbytes + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -682,12 +690,12 @@ void ROOT::RVectorField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to
 
    ROOT::NTupleSize_t nItems;
    RNTupleLocalIndex collectionStart;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
 
    if (fSubfields[0]->IsSimple()) {
       typedValue->resize(nItems * fItemSize);
       if (nItems)
-         GetPrincipalColumnOf(*fSubfields[0])->ReadV(collectionStart, nItems, typedValue->data());
+         GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(collectionStart, nItems, typedValue->data());
       return;
    }
 
@@ -837,7 +845,7 @@ std::size_t ROOT::RField<std::vector<bool>>::AppendImpl(const void *from)
       CallAppendOn(*fSubfields[0], &bval);
    }
    fNWritten += count;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return count + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -848,7 +856,7 @@ void ROOT::RField<std::vector<bool>>::ReadGlobalImpl(ROOT::NTupleSize_t globalIn
    if (fOnDiskNRepetitions == 0) {
       ROOT::NTupleSize_t nItems;
       RNTupleLocalIndex collectionStart;
-      fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
+      fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
       typedValue->resize(nItems);
       for (std::size_t i = 0; i < nItems; ++i) {
          bool bval;
@@ -872,7 +880,7 @@ void ROOT::RField<std::vector<bool>>::ReadInClusterImpl(ROOT::RNTupleLocalIndex 
    if (fOnDiskNRepetitions == 0) {
       ROOT::NTupleSize_t nItems;
       RNTupleLocalIndex collectionStart;
-      fPrincipalColumn->GetCollectionInfo(localIndex, &collectionStart, &nItems);
+      fPrincipalColumn->ForReading()->GetCollectionInfo(localIndex, &collectionStart, &nItems);
       typedValue->resize(nItems);
       for (std::size_t i = 0; i < nItems; ++i) {
          bool bval;
@@ -963,7 +971,7 @@ ROOT::RArrayAsRVecField::RArrayAsRVecField(std::string_view fieldName, std::uniq
      fArrayLength(arrayLength)
 {
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = "ROOT::VecOps::RVec<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias("ROOT::VecOps::RVec<" + itemField->GetTypeAlias() + ">");
    Attach(std::move(itemField), "_0");
    fValueSize =
       Internal::EvalRVecValueSize(fSubfields[0]->GetAlignment(), fSubfields[0]->GetValueSize(), GetAlignment());
@@ -1000,7 +1008,7 @@ void ROOT::RArrayAsRVecField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, voi
    auto begin = RRVecField::ResizeRVec(to, fArrayLength, fItemSize, fSubfields[0].get(), fItemDeleter.get());
 
    if (fSubfields[0]->IsSimple()) {
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(globalIndex * fArrayLength, fArrayLength, begin);
+      GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(globalIndex * fArrayLength, fArrayLength, begin);
       return;
    }
 
@@ -1015,7 +1023,7 @@ void ROOT::RArrayAsRVecField::ReadInClusterImpl(RNTupleLocalIndex localIndex, vo
    auto begin = RRVecField::ResizeRVec(to, fArrayLength, fItemSize, fSubfields[0].get(), fItemDeleter.get());
 
    if (fSubfields[0]->IsSimple()) {
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(localIndex * fArrayLength, fArrayLength, begin);
+      GetPrincipalColumnOf(*fSubfields[0])->ForReading()->ReadV(localIndex * fArrayLength, fArrayLength, begin);
       return;
    }
 
@@ -1067,7 +1075,7 @@ ROOT::RArrayAsVectorField::RArrayAsVectorField(std::string_view fieldName, std::
      fArrayLength(arrayLength)
 {
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = "std::vector<" + itemField->GetTypeAlias() + ">";
+      SetTypeAlias("std::vector<" + itemField->GetTypeAlias() + ">");
    Attach(std::move(itemField), "_0");
    if (!(fSubfields[0]->GetTraits() & kTraitTriviallyDestructible))
       fItemDeleter = GetDeleterOf(*fSubfields[0]);
@@ -1104,7 +1112,9 @@ void ROOT::RArrayAsVectorField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, v
 
    if (fSubfields[0]->IsSimple()) {
       typedValue->resize(fArrayLength * fItemSize);
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(globalIndex * fArrayLength, fArrayLength, typedValue->data());
+      GetPrincipalColumnOf(*fSubfields[0])
+         ->ForReading()
+         ->ReadV(globalIndex * fArrayLength, fArrayLength, typedValue->data());
       return;
    }
 
@@ -1121,7 +1131,9 @@ void ROOT::RArrayAsVectorField::ReadInClusterImpl(ROOT::RNTupleLocalIndex localI
 
    if (fSubfields[0]->IsSimple()) {
       typedValue->resize(fArrayLength * fItemSize);
-      GetPrincipalColumnOf(*fSubfields[0])->ReadV(localIndex * fArrayLength, fArrayLength, typedValue->data());
+      GetPrincipalColumnOf(*fSubfields[0])
+         ->ForReading()
+         ->ReadV(localIndex * fArrayLength, fArrayLength, typedValue->data());
       return;
    }
 

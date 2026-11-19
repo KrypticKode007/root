@@ -442,6 +442,7 @@ ROOT::RFileKeyIterable::RIterator::RIterator(TIterator *iter, Pattern_t pattern,
 
 ROOT::RFileKeyIterable::RIterator ROOT::RFileKeyIterable::begin() const
 {
+   R__ASSERT(fFile);
    return {fFile->GetListOfKeys()->MakeIterator(), fPattern, fFlags};
 }
 
@@ -553,6 +554,9 @@ void RFile::Print(std::ostream &out) const
 
 size_t RFile::Flush()
 {
+   if (!fFile)
+      throw ROOT::RException(R__FAIL("File has been closed"));
+
    return fFile->Write();
 }
 
@@ -583,6 +587,25 @@ std::optional<ROOT::RKeyInfo> RFile::GetKeyInfo(std::string_view path) const
 
    RKeyInfo keyInfo(*key);
    return keyInfo;
+}
+
+ROOT::RFileHeader ROOT::RFile::GetFileHeader() const
+{
+   if (!fFile)
+      throw ROOT::RException(R__FAIL("File has been closed"));
+
+   ROOT::RFileHeader header;
+   header.fVersion = fFile->GetVersion();
+   header.fBEGIN = fFile->GetBEGIN();
+   header.fEND = fFile->GetEND();
+   header.fSeekFree = fFile->GetSeekFree();
+   header.fNBytesFree = fFile->GetNbytesFree();
+   header.fUnits = fFile->GetUnits();
+   header.fCompression = fFile->GetCompressionSettings();
+   header.fSeekInfo = fFile->GetSeekInfo();
+   header.fNBytesInfo = fFile->GetNbytesInfo();
+
+   return header;
 }
 
 void *ROOT::Internal::RFile_GetObjectFromKey(RFile &file, const RKeyInfo &key)

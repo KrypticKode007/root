@@ -202,6 +202,14 @@ TEST(ONNX, LinearWithLeakyRelu)
    expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
 }
 
+TEST(ONNX, ThresholdedRelu)
+{
+   SofieReference ref = readReference("ThresholdedRelu");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<float>, "ThresholdedRelu", ref.f32("input0"));
+
+   expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
 
 TEST(ONNX, LinearWithSigmoid)
 {
@@ -1176,6 +1184,15 @@ TEST(ONNX, ConvTransposeBias2dBatched)
    expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
 }
 
+TEST(ONNX, ConvTransposeGroup2d)
+{
+   SofieReference ref = readReference("ConvTransposeGroup2d");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<float>, "ConvTransposeGroup2d", ref.f32("input0"));
+
+   expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
+
 TEST(ONNX, Sqrt)
 {
    SofieReference ref = readReference("Sqrt");
@@ -1291,6 +1308,18 @@ TEST(ONNX, LayerNormalization4d)
    ASSERT_INCLUDE_AND_RUN(std::vector<float>, "LayerNormalization4d", ref.f32("input0"));
 
    expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, LayerNormalizationAxis0)
+{
+   SofieReference ref = readReference("LayerNormalizationAxis0");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<std::vector<float>>, "LayerNormalizationAxis0", ref.f32("input0"));
+
+   ASSERT_EQ(output.size(), 3u);
+   expectNear(output[0], ref.f32("output0"), DEFAULT_TOLERANCE);
+   expectNear(output[1], ref.f32("output1"), DEFAULT_TOLERANCE);
+   expectNear(output[2], ref.f32("output2"), DEFAULT_TOLERANCE);
 }
 
 TEST(ONNX, InstanceNormalization)
@@ -2363,6 +2392,33 @@ TEST(ONNX, AliasChainSingle)
    SofieReference ref = readReference("AliasChainSingle");
 
    ASSERT_INCLUDE_AND_RUN(std::vector<float>, "AliasChainSingle", ref.f32("input0"));
+
+   expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, UnsqueezeUnsortedAxes)
+{
+   SofieReference ref = readReference("UnsqueezeUnsortedAxes");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<float>, "UnsqueezeUnsortedAxes", ref.f32("input0"));
+
+   expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, UnsqueezeNegativeAxes)
+{
+   SofieReference ref = readReference("UnsqueezeNegativeAxes");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<float>, "UnsqueezeNegativeAxes", ref.f32("input0"));
+
+   expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
+}
+
+TEST(ONNX, UnsqueezeAxesAttribute)
+{
+   SofieReference ref = readReference("UnsqueezeAxesAttribute");
+
+   ASSERT_INCLUDE_AND_RUN(std::vector<float>, "UnsqueezeAxesAttribute", ref.f32("input0"));
 
    expectNear(output, ref.f32("output0"), DEFAULT_TOLERANCE);
 }

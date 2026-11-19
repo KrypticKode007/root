@@ -27,6 +27,7 @@ echo "        ../../core/rint/                 \\" >> Doxyfile_INPUT
 echo "        ../../core/testsupport/          \\" >> Doxyfile_INPUT
 echo "        ../../core/thread/               \\" >> Doxyfile_INPUT
 echo "        ../../core/unix/                 \\" >> Doxyfile_INPUT
+echo "        ../../core/utils/                \\" >> Doxyfile_INPUT
 echo "        ../../core/winnt/                \\" >> Doxyfile_INPUT
 echo "        ../../core/imt/                  \\" >> Doxyfile_INPUT
 echo "        ../../core/zip/inc/Compression.h \\" >> Doxyfile_INPUT
@@ -73,6 +74,7 @@ echo "        ../../tutorials/                 \\" >> Doxyfile_INPUT
 echo "        ../../bindings/tpython/          \\" >> Doxyfile_INPUT
 echo "        ../../bindings/pyroot/           \\" >> Doxyfile_INPUT
 echo "        ../../bindings/pyroot/pythonizations/python/ROOT/_pythonization/          \\" >> Doxyfile_INPUT
+echo "        ../../bindings/pyroot/pythonizations/python/ROOT/_pythonization/_ml_dataloader.py \\" >> Doxyfile_INPUT
 
 # echo "        ../../core/lzma/                 \\" >> Doxyfile_INPUT
 # echo "        ../../core/newdelete/            \\" >> Doxyfile_INPUT

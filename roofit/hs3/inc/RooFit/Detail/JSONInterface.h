@@ -13,12 +13,9 @@
 #ifndef RooFit_Detail_JSONInterface_h
 #define RooFit_Detail_JSONInterface_h
 
-#include <ROOT/RSpan.hxx>
-
 #include <iostream>
-#include <map>
-#include <unordered_map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -38,13 +35,7 @@ public:
          ++_pos;
          return *this;
       }
-      child_iterator_t &operator--()
-      {
-         --_pos;
-         return *this;
-      }
       Nd &operator*() const { return **_pos; }
-      Nd &operator->() const { return **_pos; }
 
       friend bool operator!=(child_iterator_t const &lhs, child_iterator_t const &rhs) { return lhs._pos != rhs._pos; }
       friend bool operator==(child_iterator_t const &lhs, child_iterator_t const &rhs) { return lhs._pos == rhs._pos; }
@@ -80,7 +71,6 @@ public:
    JSONNode &operator<<(int i);
    JSONNode &operator<<(double d);
    JSONNode &operator<<(bool b);
-   const JSONNode &operator>>(std::string &v) const;
    JSONNode &operator[](std::string const &k);
    const JSONNode &operator[](std::string const &k) const;
    bool is_container() const;
@@ -100,9 +90,10 @@ public:
    int val_int() const;
    double val_double() const;
    bool val_bool() const;
+   /// The value as a boolean, or std::nullopt if it is none. Like val_bool(), the integers 0 and 1 are accepted.
+   std::optional<bool> try_val_bool() const;
    template <class T>
    T val_t() const;
-   bool has_key() const;
    bool has_val() const;
    bool has_child(std::string const &) const;
    JSONNode &append_child();
@@ -122,28 +113,6 @@ public:
       set_seq();
       for (auto const &item : coll) {
          append_child() << item;
-      }
-   }
-
-   template <typename Collection>
-   void fill_seq(Collection const &coll, size_t nmax)
-   {
-      set_seq();
-      size_t n = 0;
-      for (auto const &item : coll) {
-         if (n >= nmax)
-            break;
-         append_child() << item;
-         ++n;
-      }
-   }
-
-   template <typename Collection, typename TransformationFunc>
-   void fill_seq(Collection const &coll, TransformationFunc func)
-   {
-      set_seq();
-      for (auto const &item : coll) {
-         append_child() << func(item);
       }
    }
 
@@ -218,17 +187,6 @@ private:
    std::unique_ptr<JSONNode::Storage> _storage;
 };
 
-std::ostream &operator<<(std::ostream &os, RooFit::Detail::JSONNode const &s);
-
-template <class T>
-std::vector<T> &operator<<(std::vector<T> &v, RooFit::Detail::JSONNode::children_view const &cv)
-{
-   for (const auto &e : cv) {
-      v.push_back(e.val_t<T>());
-   }
-   return v;
-}
-
 template <class T>
 std::vector<T> &operator<<(std::vector<T> &v, RooFit::Detail::JSONNode::const_children_view const &cv)
 {
@@ -246,45 +204,6 @@ std::vector<T> &operator<<(std::vector<T> &v, RooFit::Detail::JSONNode const &n)
    }
    v << n.children();
    return v;
-}
-
-inline RooFit::Detail::JSONNode &operator<<(RooFit::Detail::JSONNode &n, std::span<const double> v)
-{
-   n.fill_seq(v);
-   return n;
-}
-
-inline RooFit::Detail::JSONNode &operator<<(RooFit::Detail::JSONNode &n, std::span<const float> v)
-{
-   n.fill_seq(v);
-   return n;
-}
-
-inline RooFit::Detail::JSONNode &operator<<(RooFit::Detail::JSONNode &n, std::span<const int> v)
-{
-   n.fill_seq(v);
-   return n;
-}
-
-template <class Key, class T, class Hash, class KeyEqual, class Allocator>
-RooFit::Detail::JSONNode &
-operator<<(RooFit::Detail::JSONNode &n, const std::unordered_map<Key, T, Hash, KeyEqual, Allocator> &m)
-{
-   n.set_map();
-   for (const auto &it : m) {
-      n[it.first] << it.second;
-   }
-   return n;
-}
-
-template <class Key, class T, class Compare, class Allocator>
-RooFit::Detail::JSONNode &operator<<(RooFit::Detail::JSONNode &n, const std::map<Key, T, Compare, Allocator> &m)
-{
-   n.set_map();
-   for (const auto &it : m) {
-      n[it.first] << it.second;
-   }
-   return n;
 }
 
 template <>

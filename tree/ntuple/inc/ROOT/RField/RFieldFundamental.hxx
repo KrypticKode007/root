@@ -369,7 +369,7 @@ protected:
       const auto n = r.size();
       fAvailableColumns.reserve(n);
       for (std::uint16_t i = 0; i < n; ++i) {
-         auto &column = fAvailableColumns.emplace_back(ROOT::Internal::RColumn::Create<T>(r[i][0], 0, i));
+         auto &column = fAvailableColumns.emplace_back(ROOT::Internal::RWriteColumn::Create<T>(r[i][0], 0, i));
          if (r[i][0] == ROOT::ENTupleColumnType::kReal32Trunc) {
             column->SetBitsOnStorage(fBitWidth);
          } else if (r[i][0] == ROOT::ENTupleColumnType::kReal32Quant) {
@@ -388,8 +388,8 @@ protected:
          if (onDiskTypes.empty())
             break;
 
-         auto &column =
-            fAvailableColumns.emplace_back(ROOT::Internal::RColumn::Create<T>(onDiskTypes[0], 0, representationIndex));
+         auto &column = fAvailableColumns.emplace_back(
+            ROOT::Internal::RReadColumn::Create<T>(onDiskTypes[0], 0, representationIndex));
          if (onDiskTypes[0] == ROOT::ENTupleColumnType::kReal32Trunc) {
             const auto &fdesc = desc.GetFieldDescriptor(Base::GetOnDiskId());
             const auto &coldesc = desc.GetColumnDescriptor(fdesc.GetLogicalColumnIds()[representationIndex]);
@@ -404,7 +404,7 @@ protected:
          }
          fColumnRepresentatives.emplace_back(onDiskTypes);
          if (representationIndex > 0) {
-            fAvailableColumns[0]->MergeTeams(*fAvailableColumns[representationIndex]);
+            fAvailableColumns[0]->ForReading()->MergeTeams(*(fAvailableColumns[representationIndex]->ForReading()));
          }
 
          representationIndex++;
@@ -427,7 +427,7 @@ public:
 
    /// Set the on-disk representation of this field to a single-precision float truncated to `nBits`.
    /// The remaining (32 - `nBits`) bits will be truncated from the number's mantissa.
-   /// `nBits` must be $10 <= nBits <= 31$ (this means that at least 1 bit
+   /// `nBits` must be \f$10 <= nBits <= 31\f$ (this means that at least 1 bit
    /// of mantissa is always preserved). Note that this effectively rounds the number towards 0.
    /// For a double-precision field, this implies first a cast to single-precision, then the truncation.
    /// This is mutually exclusive with SetHalfPrecision() and SetQuantized() and supersedes them if called after them.
@@ -445,7 +445,7 @@ public:
    }
 
    /// Sets this field to use a quantized integer representation using `nBits` per value.
-   /// It must be $1 <= nBits <= 32$.
+   /// It must be \f$1 <= nBits <= 32\f$.
    /// `valueRange.first` and `valueRange.second` are respectively the min and max value allowed for this field.
    /// They must not be infinity, `NaN` or denormal floats, and valueRange.second must be greater or equal to
    /// valueRange.first.

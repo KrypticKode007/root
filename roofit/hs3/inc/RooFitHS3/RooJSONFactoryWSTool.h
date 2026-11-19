@@ -35,6 +35,7 @@ struct ParameterPoint;
 struct ParameterValue;
 struct ToolExportState;
 struct ToolImportState;
+struct Version;
 template <class Tag>
 struct Ref;
 using DistributionRef = Ref<struct DistributionTag>;
@@ -46,6 +47,8 @@ namespace RooStats {
 class ModelConfig;
 }
 class RooRealVar;
+class RooAbsCategory;
+class RooSimultaneous;
 
 class RooJSONFactoryWSTool {
 public:
@@ -59,6 +62,26 @@ public:
       /// before ROOT 6.26 by their structure, and don't write them, since `histfactory_dist` implies them. Turn this
       /// off if a workspace has such factors that are not meant as bin widths: they are then written as normfactors.
       bool identifyLegacyBinWidthFactors = true;
+      /// HS3 requires the components of a combined distribution to have distinct variates, e.g. "mass_SR" and
+      /// "mass_CR" instead of one "mass". If enabled, the observables of every combined data set are renamed on
+      /// export to "obs_<key>" (the labels of the key joined by "_"), or "obs_<key>_<observable>" if a component
+      /// has several observables; the components of the matching RooSimultaneous are written with the renamed
+      /// observables (functions depending on them get the suffix "_<key>"). This allows exporting workspaces whose
+      /// components share an observable. Off by default: without it, such workspaces can't be exported.
+      bool renameCombinedObservables = false;
+      /// HS3 requires the terms of a likelihood and the components of a combined distribution to have distinct
+      /// variates, e.g. "mass_SR" and "mass_CR" for the observables of two channels instead of one "mass". By
+      /// default, the export fails otherwise. If true, the document is written anyway, with a warning for every
+      /// shared variate. It is not valid HS3 and can't be read back before the variates are renamed, e.g. by hand in
+      /// the JSON.
+      bool allowExportSharedVariates = false;
+      // Write array distributions (HS3 `array_dist`). If false, no `array_dist` is written: HistFactory constraints
+      // are named individually, and a RooProdPdf tagged as array distribution is written as `product_dist`.
+      bool exportArrayDist = true;
+      // How the constraint terms of HistFactory models enter the likelihood: listed in "aux_distributions", with
+      // the observed values as constant parameters (false), or listed in "distributions", each paired with a data set
+      // holding the observed values of its observables (true).
+      bool exportConstraintData = false;
    };
 
    static Config &config();
@@ -68,7 +91,7 @@ public:
 
    struct CombinedData {
       std::string name;
-      std::map<std::string, std::string> components;
+      std::vector<std::string> columns;
    };
 
    RooJSONFactoryWSTool(RooWorkspace &ws);
@@ -77,22 +100,30 @@ public:
 
    static std::string name(const RooFit::Detail::JSONNode &n);
    static bool isValidName(const std::string &str);
-   static bool testValidName(const std::string &str, bool forcError);
+   static bool testValidName(const std::string &name, bool forceError);
    static std::string sanitizeName(const std::string str);
-   static void rebuildModelConfigInWorkspace(RooStats::ModelConfig *mc, RooWorkspace &ws);
 
    static RooFit::Detail::JSONNode &appendNamedChild(RooFit::Detail::JSONNode &node, std::string const &name);
    static RooFit::Detail::JSONNode const *findNamedChild(RooFit::Detail::JSONNode const &node, std::string const &name);
 
    static void fillSeq(RooFit::Detail::JSONNode &node, RooAbsCollection const &coll, size_t nMax = -1);
 
+   /// The object `objname` from the workspace, imported from the document first if needed. Throws a
+   /// DependencyMissingError if neither has it.
    template <class T>
    T *request(const std::string &objname, const std::string &requestAuthor)
    {
-      if (T *out = requestImpl<T>(objname)) {
+      if (T *out = tryRequest<T>(objname)) {
          return out;
       }
       throw DependencyMissingError(requestAuthor, objname, T::Class()->GetName());
+   }
+
+   /// Like request(), but returns nullptr if neither the workspace nor the document has the object.
+   template <class T>
+   T *tryRequest(const std::string &objname)
+   {
+      return requestImpl<T>(objname);
    }
 
    template <class T>
@@ -159,21 +190,17 @@ public:
    readBinnedData(const RooFit::Detail::JSONNode &n, const std::string &namecomp, RooArgSet const &vars);
 
    bool importJSON(std::string const &filename);
-   bool importJSON(std::istream &os);
+   bool importJSON(std::istream &is);
    bool exportJSON(std::string const &fileName);
    bool exportJSON(std::ostream &os);
 
    std::string exportJSONtoString();
    bool importJSONfromString(const std::string &s);
    void importJSONElement(const std::string &name, const std::string &jsonString);
-   void importVariableElement(const RooFit::Detail::JSONNode &n);
+   void importVariableElement(const RooFit::Detail::JSONNode &elementNode);
 
    void importFunction(const RooFit::Detail::JSONNode &p, bool importAllDependants);
    void importFunction(const std::string &jsonString, bool importAllDependants);
-
-   static std::unique_ptr<RooFit::Detail::JSONTree> createNewJSONTree();
-
-   static RooFit::Detail::JSONNode &makeVariablesNode(RooFit::Detail::JSONNode &rootNode);
 
    // error handling helpers
    class DependencyMissingError : public std::runtime_error {
@@ -192,20 +219,10 @@ public:
       const std::string &classname() const { return _class; }
    };
 
-   template <typename... Keys_t>
-   static RooFit::Detail::JSONNode &getRooFitInternal(RooFit::Detail::JSONNode &node, Keys_t const &...keys)
-   {
-      return node.get("misc", "ROOT_internal", keys...);
-   }
-
-   static void exportAxis(RooFit::Detail::JSONNode &obsNode, RooRealVar const &var);
-
    static void
    exportHisto(RooArgSet const &vars, std::size_t n, double const *contents, RooFit::Detail::JSONNode &output);
 
    static void exportArray(std::size_t n, double const *contents, RooFit::Detail::JSONNode &output);
-
-   void exportCategory(RooAbsCategory const &cat, RooFit::Detail::JSONNode &node);
 
    void queueExport(RooAbsArg const &arg) { _serversToExport.push_back(&arg); }
    void queueExportTemporary(RooAbsArg *arg)
@@ -215,23 +232,32 @@ public:
    }
 
    std::string exportTransformed(const RooAbsReal *original, const std::string &suffix, const std::string &formula);
+   std::string exportAsArrayComponent(RooAbsPdf const &pdf, std::string const &arrayName);
+   /// The name of the top-level object whose export is in progress (the root of the current export recursion).
+   std::string const &exportRootName() const;
+   void recordConstraintTerms(std::string const &pdfName, std::vector<std::string> const &terms);
+   /// Record that `observable` is the observable of the constraint term `pdf` (the side that is not the constrained
+   /// parameter). A Gaussian whose mean it is gets written with x and mean swapped, so that the observable is x.
+   void setConstraintObservable(RooAbsPdf const &pdf, std::string const &observable);
+   std::string const *constraintObservable(std::string const &pdfName) const;
 
    void setAttribute(const std::string &obj, const std::string &attrib);
    bool hasAttribute(const std::string &obj, const std::string &attrib);
    std::string getStringAttribute(const std::string &obj, const std::string &attrib);
    void setStringAttribute(const std::string &obj, const std::string &attrib, const std::string &value);
 
-   /// The "hs3_version" of the document that is currently being imported, or an empty string outside of an import.
-   std::string const &hs3VersionInput() const { return _hs3VersionInput; }
+   /// The HS3 version of the document that is currently being imported. Outside of an import it is 0.0.0, like a
+   /// version that can't be parsed.
+   RooFit::HS3::Version hs3Version() const;
 
 private:
    template <class T>
    T *requestImpl(const std::string &objname);
-   void exportObject(RooAbsArg const &func, std::set<std::string> &exportedObjectNames);
+   void exportObject(RooAbsArg const &func);
 
    // To export multiple objects sorted alphabetically
    template <class T>
-   void exportObjects(T const &args, std::set<std::string> &exportedObjectNames)
+   void exportObjects(T const &args)
    {
       RooArgSet argSet;
       for (RooAbsArg const *arg : args) {
@@ -239,10 +265,14 @@ private:
       }
       argSet.sort();
       for (RooAbsArg *arg : argSet) {
-         exportObject(*arg, exportedObjectNames);
+         exportObject(*arg);
       }
    }
+   void exportArrayDists();
+   bool exportConstraintData(std::string const &term, RooArgSet const *globalObservables);
 
+   void exportSimultaneous(RooSimultaneous const &simPdf);
+   void recordCategory(RooAbsCategory const &cat);
    void exportData(RooAbsData const &data);
    RooJSONFactoryWSTool::CombinedData exportCombinedData(RooAbsData const &data);
 
@@ -259,17 +289,16 @@ private:
    void exportAllObjects(RooFit::Detail::JSONNode &n);
 
    void exportModelConfig(RooStats::ModelConfig const &mc,
-                          const std::vector<RooJSONFactoryWSTool::CombinedData> &combined,
+                          const std::vector<RooJSONFactoryWSTool::CombinedData> &combDataSets,
                           const std::vector<RooAbsData *> &single);
 
    void exportSingleModelConfig(RooStats::ModelConfig const &mc, std::string const &analysisName,
-                                std::map<std::string, std::string> const *dataComponents);
+                                std::string const *dataName);
 
    friend void RooFit::HS3::setExportedObject(RooJSONFactoryWSTool &tool, RooFit::HS3::HistFactoryDist dist,
                                               std::vector<RooFit::HS3::DistributionRef> channelConstraints);
 
    // member variables
-   std::string _hs3VersionInput;
    RooWorkspace &_workspace;
 
    // objects to represent intermediate information
@@ -277,6 +306,13 @@ private:
    std::unique_ptr<RooFit::HS3::ToolExportState> _export;
    std::vector<RooAbsArg const *> _serversToExport;
    std::vector<RooAbsArg const *> _serversToDelete;
+   // Renaming of the observables of combined data sets, see Config::renameCombinedObservables: for each data set and
+   // each selection label, the new name of each observable; for each RooSimultaneous and selection label, the
+   // component with renamed observables to export instead of the original one. The objects are owned here.
+   std::map<std::string, std::map<std::string, std::map<std::string, std::string>>> _combinedObservableRenames;
+   std::map<std::string, std::map<std::string, RooAbsPdf const *>> _renamedComponents;
+   std::vector<std::unique_ptr<RooAbsArg>> _renamedObjects;
+   void prepareCombinedObservableRenaming();
 
    // The objects that are currently being imported, innermost last, to detect circular dependencies.
    std::vector<std::string> _importStack;

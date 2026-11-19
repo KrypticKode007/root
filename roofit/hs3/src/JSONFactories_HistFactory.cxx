@@ -32,10 +32,10 @@
 #include <RooProduct.h>
 #include <RooWorkspace.h>
 #include <RooFitImplHelpers.h>
+#include <RooFit/ModelConfig.h>
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <cmath>
 #include <iterator>
 #include <limits>
@@ -51,11 +51,9 @@
 #include "JSONIOUtils.h"
 
 using RooFit::Detail::JSONNode;
-using RooFit::HS3::additivePolynomialLinear;
 using RooFit::HS3::Interpolation;
 using RooFit::HS3::InterpolationClass;
 using RooFit::HS3::multiplicativePiecewiseExponential;
-using RooFit::HS3::multiplicativePolynomialExponential;
 
 namespace HS3 = RooFit::HS3;
 
@@ -76,16 +74,13 @@ double round_prec(double d, int nSig)
    return sf * std::round(d / sf);
 }
 
+// An interpolation as it is written in the document, for messages.
 std::string interpolationString(const Interpolation &interpolation)
 {
+   auto tree = RooFit::Detail::JSONTree::create();
+   HS3::writeInterpolation(tree->rootnode(), interpolation);
    std::stringstream ss;
-   ss << R"({"type":")" << toString(interpolation.type) << R"(","in":")" << toString(interpolation.in) << R"(","out":)";
-   if (interpolation.out) {
-      ss << '"' << toString(*interpolation.out) << '"';
-   } else {
-      ss << "null";
-   }
-   ss << '}';
+   tree->rootnode().writeJSON(ss);
    return ss.str();
 }
 
@@ -138,29 +133,6 @@ std::vector<int> toCodes(std::vector<Interpolation> const &interpolations, Inter
    return out;
 }
 
-// Reports the problems with an object that doesn't come with a document.
-void report(std::string const &name, HS3::Diagnostics &diagnostics)
-{
-   for (auto &diagnostic : diagnostics) {
-      diagnostic.path = name + (diagnostic.path.empty() ? "" : "." + diagnostic.path);
-   }
-   HS3::report(diagnostics);
-}
-
-int interpolationCode(std::optional<Interpolation> const &interpolation,
-                      std::optional<Interpolation> const &defaultInterpolation, InterpolationClass interpolationClass,
-                      std::string const &context)
-{
-   if (interpolation) {
-      return codeFromInterpolation(*interpolation, interpolationClass, context);
-   }
-   // HS3 forbids implementation-specific default interpolations.
-   if (!defaultInterpolation) {
-      RooJSONFactoryWSTool::error(context + " is not given, and the channel has no \"default_interpolation\"");
-   }
-   return codeFromInterpolation(*defaultInterpolation, interpolationClass, context);
-}
-
 void erasePrefix(std::string &str, std::string_view prefix)
 {
    if (startsWith(str, prefix)) {
@@ -184,35 +156,56 @@ void sortByName(Coll &coll)
    std::sort(coll.begin(), coll.end(), [](auto &l, auto &r) { return l.name < r.name; });
 }
 
+// Whether any of the gamma parameters names a constraint. Otherwise, they are all free, and nothing is written.
+bool anyNamed(HS3::GammaConstraintPdfs const &constraints)
+{
+   return std::any_of(constraints.pdfs.begin(), constraints.pdfs.end(),
+                      [](auto const &pdf) { return pdf.has_value(); });
+}
+
 template <class T>
 T *findClient(RooAbsArg *gamma)
 {
    for (const auto &client : gamma->clients()) {
       if (auto casted = dynamic_cast<T *>(client)) {
          return casted;
-      } else {
-         T *c = findClient<T>(client);
-         if (c)
-            return c;
+      }
+      if (T *found = findClient<T>(client)) {
+         return found;
       }
    }
    return nullptr;
 }
 
-RooAbsPdf *findConstraint(RooAbsArg *g)
+template <class T>
+T *findAmong(RooAbsArg *g, std::vector<RooAbsPdf *> const &pdfs)
+{
+   for (RooAbsPdf *pdf : pdfs) {
+      if (auto casted = dynamic_cast<T *>(pdf); casted && casted->dependsOn(*g)) {
+         return casted;
+      }
+   }
+   return nullptr;
+}
+
+// Find the constraint of the parameter `g`: preferably among the constraint terms `channelConstraints` of the channel
+// (the other factors of its product), otherwise among the clients of `g`. Looking at the channel first avoids taking
+// another pdf that depends on the parameter, e.g. in another channel, for its constraint.
+RooAbsPdf *findConstraint(RooAbsArg *g, std::vector<RooAbsPdf *> const &channelConstraints)
 {
    if (!g)
       return nullptr;
+   if (auto *constraint = findAmong<RooPoisson>(g, channelConstraints))
+      return constraint;
+   if (auto *constraint = findAmong<RooGaussian>(g, channelConstraints))
+      return constraint;
+   if (auto *constraint = findAmong<RooLognormal>(g, channelConstraints))
+      return constraint;
    if (auto *constraint = findClient<RooPoisson>(g))
       return constraint;
    if (auto *constraint = findClient<RooGaussian>(g))
       return constraint;
    return findClient<RooLognormal>(g);
-}
-
-inline std::string defaultGammaName(std::string const &sysname, std::size_t i)
-{
-   return "gamma_" + sysname + "_bin_" + std::to_string(i);
 }
 
 RooRealVar &createNominal(RooWorkspace &ws, std::string const &parname, double val, double min, double max)
@@ -229,21 +222,40 @@ std::string constraintName(std::string const &paramName)
    return paramName + "Constraint";
 }
 
-RooAbsPdf *findNamedConstraint(RooJSONFactoryWSTool &tool, std::string const &constraintName, std::string const &sample)
+// The component of the array distribution `array` that constrains `param`: the one that depends on it.
+RooAbsPdf &arrayComponentFor(RooProdPdf const &array, RooAbsArg const &param, std::string const &context)
 {
-   if (auto *constraint = tool.workspace()->pdf(constraintName)) {
-      return constraint;
-   }
-
-   try {
-      return tool.request<RooAbsPdf>(constraintName, sample);
-   } catch (RooJSONFactoryWSTool::DependencyMissingError const &err) {
-      if (err.child() != constraintName) {
-         throw;
+   std::vector<RooAbsPdf *> matches;
+   for (RooAbsPdf *pdf : static_range_cast<RooAbsPdf *>(array.pdfList())) {
+      if (pdf->dependsOn(param)) {
+         matches.push_back(pdf);
       }
    }
+   if (matches.size() == 1) {
+      return *matches.front();
+   }
+   const std::string what = "the array distribution '" + std::string(array.GetName()) +
+                            "' named as the constraint of '" + param.GetName() + "' (" + context + ") has ";
+   if (matches.empty()) {
+      RooJSONFactoryWSTool::error(what + "no component that depends on this parameter");
+   }
+   RooJSONFactoryWSTool::error(what + std::to_string(matches.size()) +
+                               " components that depend on this parameter, but a parameter can only be constrained "
+                               "by one component");
+}
 
-   return nullptr;
+// Find the constraint distribution `constraintName` of the parameter `param`. If the name resolves to an array
+// distribution, the component that depends on the parameter is returned: that is the term that enters the likelihood
+// for this parameter, and the whole array enters once through the components of all of its parameters.
+RooAbsPdf &findNamedConstraint(RooJSONFactoryWSTool &tool, std::string const &constraintName, RooAbsArg const &param,
+                               std::string const &context)
+{
+   RooAbsPdf *constraint = tool.tryRequest<RooAbsPdf>(constraintName);
+   if (!constraint) {
+      RooJSONFactoryWSTool::error("unable to find the constraint '" + constraintName + "' of " + context);
+   }
+   auto const *array = dynamic_cast<RooProdPdf const *>(constraint);
+   return array && array->getAttribute(arrayDistTag) ? arrayComponentFor(*array, param, context) : *constraint;
 }
 
 // The parameter of a modifier, which is created if the document doesn't define it. It's a variable, or a constant if
@@ -273,7 +285,8 @@ void setErrorIfVariable(RooAbsReal &param, double error)
 // All constraints of parameters that control a whole sample are created here. Following the HS3 standard, the nominal
 // value is defined by the type of the modifier, and the standard deviation is one.
 void addConstraint(RooJSONFactoryWSTool &tool, HS3::Constraint const &constraint, RooAbsReal &param, double nominal,
-                   std::string const &modifier, std::string const &sample, RooArgSet &constraints)
+                   const char *modifierType, std::string const &modifier, std::string const &sample,
+                   RooArgSet &constraints)
 {
    RooWorkspace &ws = *tool.workspace();
    std::visit(HS3::overloaded{
@@ -292,42 +305,120 @@ void addConstraint(RooJSONFactoryWSTool &tool, HS3::Constraint const &constraint
                     constraints.add(pdf ? *pdf : tool.wsEmplace<RooGaussian>(name, param, nom, 1.));
                  },
                  [&](HS3::ConstraintPdf const &constraintPdf) {
-                    RooAbsPdf *pdf = findNamedConstraint(tool, constraintPdf.pdf.name, sample);
-                    if (!pdf) {
-                       RooJSONFactoryWSTool::error("unable to find definition of of constraint '" +
-                                                   constraintPdf.pdf.name + "' for modifier '" + modifier + "'");
-                    }
-                    if (auto gauss = dynamic_cast<RooGaussian *>(pdf)) {
+                    RooAbsPdf &pdf = findNamedConstraint(tool, constraintPdf.pdf.name, param,
+                                                         std::string("the ") + modifierType + " modifier '" + modifier +
+                                                            "' of sample '" + sample + "'");
+                    if (auto gauss = dynamic_cast<RooGaussian *>(&pdf)) {
                        setErrorIfVariable(param, gauss->getSigma().getVal());
                     }
-                    constraints.add(*pdf);
+                    constraints.add(pdf);
                  },
               },
               constraint);
 }
 
-// Create the ParamHistFunc of the gamma parameters, together with their constraints.
+// The constraint of the parameter of a normsys or histosys modifier, whose nominal value is zero. Before HS3 named the
+// constraint distributions in "constraints", RooFit created the global observable "nom_<parameter>", which the
+// constraint distribution of older documents may use without defining it.
+void addSysConstraint(RooJSONFactoryWSTool &tool, HS3::Constraint const &constraint, RooAbsReal &param,
+                      const char *modifierType, std::string const &modifier, std::string const &sample,
+                      RooArgSet &constraints)
+{
+   auto const *pdf = std::get_if<HS3::ConstraintPdf>(&constraint);
+   if (pdf && pdf->legacyName) {
+      createNominal(*tool.workspace(), param.GetName(), 0.0, -10, 10);
+   }
+   addConstraint(tool, constraint, param, 0.0, modifierType, modifier, sample, constraints);
+}
+
+// The tau of a Poisson constraint of a gamma whose mean is the product gamma * tau, like in HistFactory, or
+// std::nullopt if the constraint has another form.
+std::optional<double> findPoissonTau(RooPoisson const &constraint, RooAbsArg const &gamma)
+{
+   auto const *mean = dynamic_cast<RooProduct const *>(&constraint.getMean());
+   if (!mean) {
+      return std::nullopt;
+   }
+
+   // The tau is the constant factor. In imported workspaces, it can also be a variable that is named like it.
+   for (RooAbsArg *arg : mean->servers()) {
+      auto const *tau = dynamic_cast<RooAbsReal const *>(arg);
+      if (tau && arg != &gamma && (tau->isConstant() || endsWith(tau->GetName(), "_tau"))) {
+         return tau->getVal();
+      }
+   }
+   return std::nullopt;
+}
+
+// The relative uncertainty that the constraint distribution of a gamma encodes, if it has one of the forms of
+// HistFactory: the sigma of a Gaussian, or 1/sqrt(tau) for a Poisson distribution with mean gamma * tau. The nominal
+// value of a gamma is 1, so the sigma of a Gaussian is relative to it. It is not divided by the mean, which is the
+// gamma itself in the Gaussians that HistFactory creates.
+std::optional<double> gammaRelUncertainty(RooAbsPdf const &constraint, RooAbsArg const &gamma)
+{
+   if (auto gauss = dynamic_cast<RooGaussian const *>(&constraint)) {
+      return gauss->getSigma().getVal();
+   }
+   if (auto poisson = dynamic_cast<RooPoisson const *>(&constraint)) {
+      if (auto tau = findPoissonTau(*poisson, gamma)) {
+         return 1. / std::sqrt(*tau);
+      }
+   }
+   return std::nullopt;
+}
+
+// Configure the gammas that have a constraint distribution like HistFactory does from their relative uncertainties,
+// see configureConstrainedGammas(). The relative uncertainty of a gamma is the one in `relSigmas` if it is positive,
+// and otherwise the one that its constraint distribution encodes, see gammaRelUncertainty(). Without `relSigmas`, the
+// latter is only the initial error of the gamma. The unconstrained gammas are free, and left as they are. So are the
+// gammas that are functions defined elsewhere in the document, since only variables can be configured.
+void configureGammasWithConstraints(RooArgList const &gammas, std::vector<double> const &relSigmas,
+                                    std::vector<RooAbsPdf *> const &constraintPdfs, double minSigma)
+{
+   RooArgList constrainedGammas;
+   std::vector<double> constrainedSigmas;
+   for (std::size_t i = 0; i < gammas.size(); ++i) {
+      auto *gamma = dynamic_cast<RooRealVar *>(&gammas[i]);
+      if (!constraintPdfs[i] || !gamma) {
+         continue;
+      }
+      std::optional<double> relSigma = !relSigmas.empty() && relSigmas[i] > 0.
+                                          ? std::make_optional(relSigmas[i])
+                                          : gammaRelUncertainty(*constraintPdfs[i], *gamma);
+      // Without any known uncertainty, the gamma is left to its constraint distribution.
+      if (!relSigma) {
+         continue;
+      }
+      if (relSigmas.empty()) {
+         gamma->setError(*relSigma);
+      } else {
+         constrainedGammas.add(*gamma);
+         constrainedSigmas.push_back(*relSigma);
+      }
+   }
+   configureConstrainedGammas(constrainedGammas, constrainedSigmas, minSigma);
+}
+
+// Create the ParamHistFunc of the gamma parameters, together with their constraints. With a constraint type, RooFit
+// creates the constraints of the gammas from their relative uncertainties `vals`, like HistFactory.
 ParamHistFunc &createPHF(RooJSONFactoryWSTool &tool, std::string const &phfname, std::string const &sysname,
                          std::vector<HS3::ParameterRef> const &parnames, std::vector<double> const &vals,
                          HS3::GammaConstraint const &constraint, RooArgSet &constraints, RooArgSet const &observables,
-                         double gammaMax, double minSigma, std::size_t nBins)
+                         double gammaMax, double minSigma, std::size_t nBins, std::string const &context)
 {
    RooWorkspace &ws = *tool.workspace();
 
    // The validation made sure that there is a value, parameter and constraint for each bin, if they are given.
    RooArgList gammas;
    for (std::size_t i = 0; i < nBins; ++i) {
-      const std::string name = parnames.empty() ? defaultGammaName(sysname, i) : parnames[i].name;
-      if (auto *existing = dynamic_cast<RooAbsReal *>(ws.obj(name))) {
-         gammas.add(*existing);
-      } else {
-         gammas.add(getOrCreate<RooRealVar>(ws, name, 1., defaultGammaMin, gammaMax));
-      }
+      const std::string name = parnames.empty() ? "gamma_" + sysname + "_bin_" + std::to_string(i) : parnames[i].name;
+      auto *existing = dynamic_cast<RooAbsReal *>(ws.obj(name));
+      gammas.add(existing ? *existing : getOrCreate<RooRealVar>(ws, name, 1., defaultGammaMin, gammaMax));
    }
 
    // The gammas and `vals` are given in the order of HS3 (last axis fastest), which is also the order in which they
    // are paired below. ParamHistFunc expects its parameters in TH1 order.
-   checkParamHistFuncOrderIsDefined(tool.hs3VersionInput(), observables, "the modifier '" + sysname + "'");
+   checkParamHistFuncOrderIsDefined(tool.hs3Version(), observables, "the modifier '" + sysname + "'");
    RooArgList gammasInTH1Order = toParamHistFuncOrder(gammas, observables);
 
    // Shape modifiers of the same name in a channel share the function, so they need the same parameters.
@@ -346,23 +437,23 @@ ParamHistFunc &createPHF(RooJSONFactoryWSTool &tool, std::string const &phfname,
 
    auto addGammaConstraints = [&](Constraint::Type type) {
       for (auto const &term : createGammaConstraints(gammas, vals, minSigma, type).constraints) {
-         ws.import(*term, RooFit::RecycleConflictNodes(), RooFit::Silence());
-         constraints.add(*ws.pdf(term->GetName()));
+         constraints.add(tool.wsImport(*term));
       }
    };
 
    if (auto const *pdfs = std::get_if<HS3::GammaConstraintPdfs>(&constraint)) {
-      for (auto const &pdfName : pdfs->pdfs) {
-         if (!pdfName) {
-            continue;
+      // The constraints are resolved per gamma (in bin order, like "constraints"), which also picks the right
+      // component out of an array distribution. Unconstrained gammas get a nullptr.
+      std::vector<RooAbsPdf *> constraintPdfs;
+      for (std::size_t i = 0; i < pdfs->pdfs.size(); ++i) {
+         auto const &pdfName = pdfs->pdfs[i];
+         RooAbsPdf *pdf = pdfName ? &findNamedConstraint(tool, pdfName->name, gammas[i], context) : nullptr;
+         if (pdf) {
+            constraints.add(*pdf);
          }
-         auto *pdf = findNamedConstraint(tool, pdfName->name, sysname);
-         if (!pdf) {
-            RooJSONFactoryWSTool::error("unable to find definition of constraint '" + pdfName->name +
-                                        "' for modifier '" + sysname + "'");
-         }
-         constraints.add(*pdf);
+         constraintPdfs.push_back(pdf);
       }
+      configureGammasWithConstraints(gammas, vals, constraintPdfs, minSigma);
    }
 
    if (vals.empty()) {
@@ -370,11 +461,15 @@ ParamHistFunc &createPHF(RooJSONFactoryWSTool &tool, std::string const &phfname,
    }
 
    std::visit(HS3::overloaded{
-                 [&](HS3::Unconstrained) { configureConstrainedGammas(gammas, vals, minSigma); },
-                 [&](HS3::GammaConstraintPdfs const &) { configureConstrainedGammas(gammas, vals, minSigma); },
+                 // Free gammas are left as they are, and the ones with named constraints are configured above.
+                 [](HS3::Unconstrained) {},
+                 [](HS3::GammaConstraintPdfs const &) {},
                  [&](HS3::ConstantGammas) {
-                    for (auto *gamma : static_range_cast<RooRealVar *>(gammas)) {
-                       gamma->setConstant(true);
+                    // Only the gammas that are variables can be set constant; the others can be functions.
+                    for (RooAbsArg *gamma : gammas) {
+                       if (auto *var = dynamic_cast<RooRealVar *>(gamma)) {
+                          var->setConstant(true);
+                       }
                     }
                  },
                  [&](HS3::ConstraintType type) {
@@ -393,49 +488,17 @@ ParamHistFunc &createPHF(RooJSONFactoryWSTool &tool, std::string const &phfname,
    return phf;
 }
 
-double poissonTau(RooPoisson const &constraint, RooAbsArg const &gamma)
-{
-   auto const *mean = dynamic_cast<RooProduct const *>(&constraint.getMean());
-   if (!mean) {
-      RooJSONFactoryWSTool::error("Poisson gamma constraint mean is not a RooProduct: " +
-                                  std::string(constraint.GetName()));
-   }
-
-   for (RooAbsArg *arg : mean->servers()) {
-      if (arg == &gamma) {
-         continue;
-      }
-
-      if (auto const *tau = dynamic_cast<RooConstVar const *>(arg)) {
-         return tau->getVal();
-      }
-
-      // Imported workspaces can sometimes represent
-      // constants as constant RooRealVars.
-      if (auto const *real = dynamic_cast<RooAbsReal const *>(arg)) {
-         if (real->isConstant() || endsWith(std::string(real->GetName()), "_tau")) {
-            return real->getVal();
-         }
-      }
-   }
-
-   RooJSONFactoryWSTool::error("Could not find tau component in Poisson gamma constraint mean: " +
-                               std::string(constraint.GetName()));
-   return std::numeric_limits<double>::quiet_NaN();
-}
-
-// Returns the relative uncertainty encoded by a gamma constraint pdf. Only RooPoisson (via its tau) and RooGaussian
-// (via sigma/mean) are supported; anything else raises an error.
+// The relative uncertainty that the constraint distribution of a gamma encodes, see gammaRelUncertainty(). Constraints
+// of another form raise an error.
 double constraintRelError(RooAbsPdf const &constraint, RooAbsArg const &gamma)
 {
-   if (auto constraintP = dynamic_cast<RooPoisson const *>(&constraint)) {
-      return 1. / std::sqrt(poissonTau(*constraintP, gamma));
+   if (auto relSigma = gammaRelUncertainty(constraint, gamma)) {
+      return *relSigma;
    }
-   if (auto constraintG = dynamic_cast<RooGaussian const *>(&constraint)) {
-      return constraintG->getSigma().getVal() / constraintG->getMean().getVal();
-   }
-   RooJSONFactoryWSTool::error("currently, only RooPoisson and RooGaussian are supported as constraint types");
-   return std::numeric_limits<double>::quiet_NaN();
+   RooJSONFactoryWSTool::error("unsupported constraint '" + std::string(constraint.GetName()) + "' of '" +
+                               gamma.GetName() +
+                               "': only RooGaussian and RooPoisson with mean gamma * tau are supported for the "
+                               "relative uncertainties of gammas");
 }
 
 struct ChannelContext {
@@ -444,7 +507,6 @@ struct ChannelContext {
    RooArgSet const &observables;
    std::string fprefix;
    std::string channelName;
-   std::size_t nBins;
    RooAbsArg const *mcStatObject;
    RooArgSet &constraints;
 };
@@ -494,46 +556,44 @@ void buildSample(ChannelContext const &ctx, HS3::Sample const &sample, RooDataHi
       elems.shapeElems.add(*ctx.mcStatObject);
    }
 
-   auto context = [&](const char *type, std::string const &name) {
-      return std::string("interpolation for ") + type + " modifier '" + name + "' in sample '" + sampleName +
-             "' of channel '" + ctx.channelName + "'";
+   // The validation made sure that the channel has a "default_interpolation" if a modifier doesn't give its own.
+   auto interpolationCode = [&](std::optional<Interpolation> const &interpolation,
+                                InterpolationClass interpolationClass, const char *type, std::string const &name) {
+      return codeFromInterpolation(interpolation ? *interpolation : ctx.dist.defaultInterpolation.value(),
+                                   interpolationClass,
+                                   std::string("interpolation for ") + type + " modifier '" + name + "' in sample '" +
+                                      sampleName + "' of channel '" + ctx.channelName + "'");
    };
 
    for (HS3::Modifier const &modifier : sample.modifiers) {
       std::visit(
          HS3::overloaded{
-            [&](HS3::StatError const &) {
-               // this is dealt with at a different place, ignore it for now
-            },
+            [](HS3::StatError const &) {}, // built once for the channel, in buildHistFactoryDist()
             [&](HS3::NormFactor const &mod) {
                RooAbsReal &param = getOrCreateParameter(tool, mod.parameter.name, 1., -3, 5, mod.name);
-               setErrorIfVariable(param, 0.0);
+               // Norm factors get an initial zero error like in HistoToWorkspaceFactoryFast, unless an error was
+               // already set, e.g. by the constraint of another occurrence of this parameter.
+               if (auto *var = dynamic_cast<RooRealVar *>(&param); var && !var->hasError()) {
+                  var->setError(0.0);
+               }
                elems.normElems.add(param);
-               // for norm factors, constraints are optional
-               addConstraint(tool, mod.constraint, param, 1.0, mod.name, sampleName, ctx.constraints);
+               addConstraint(tool, mod.constraint, param, 1.0, "normfactor", mod.name, sampleName, ctx.constraints);
             },
             [&](HS3::NormSys const &mod) {
                RooAbsReal &param = getOrCreateParameter(tool, mod.parameter.name, 0., -5, 5, mod.name);
                elems.overallNps.add(param);
-               const int interp = interpolationCode(mod.interpolation, ctx.dist.defaultInterpolation,
-                                                    InterpolationClass::Flexible, context("normsys", mod.name));
-               double low = mod.lo;
-               double high = mod.hi;
-
-               // the below contains a a hack to cut off variations that go below 0
-               // This is needed because FlexibleInterpVar code 4 interpolates in log-space. Hence, values <= 0 result
-               // in NaN, which propagates throughout the model and causes evaluations to fail. If you know a nicer way
-               // to solve this, please go ahead and fix the lines below.
-               if (interp == 4 && low <= 0)
-                  low = std::numeric_limits<double>::epsilon();
-               if (interp == 4 && high <= 0)
-                  high = std::numeric_limits<double>::epsilon();
-
-               elems.overallLow.push_back(low);
-               elems.overallHigh.push_back(high);
+               const int interp =
+                  interpolationCode(mod.interpolation, InterpolationClass::Flexible, "normsys", mod.name);
+               // FlexibleInterpVar code 4 interpolates in log-space, so variations <= 0 would give NaN, which
+               // propagates through the model and makes its evaluation fail. As a hack, they are cut off.
+               auto cutOff = [&](double variation) {
+                  return interp == 4 && variation <= 0 ? std::numeric_limits<double>::epsilon() : variation;
+               };
+               elems.overallLow.push_back(cutOff(mod.lo));
+               elems.overallHigh.push_back(cutOff(mod.hi));
                elems.overallInterp.push_back(interp);
 
-               addConstraint(tool, mod.constraint, param, 0.0, mod.name, sampleName, ctx.constraints);
+               addSysConstraint(tool, mod.constraint, param, "normsys", mod.name, sampleName, ctx.constraints);
             },
             [&](HS3::HistoSys const &mod) {
                RooAbsReal &param = getOrCreateParameter(tool, mod.parameter.name, 0., -5, 5, mod.name);
@@ -547,27 +607,24 @@ void buildSample(ChannelContext const &ctx, HS3::Sample const &sample, RooDataHi
                };
                addVariation(elems.histoLo, mod.lo, "Low_");
                addVariation(elems.histoHi, mod.hi, "High_");
-               elems.histoInterp.push_back(interpolationCode(mod.interpolation, ctx.dist.defaultInterpolation,
-                                                             InterpolationClass::Piecewise,
-                                                             context("histosys", mod.name)));
-               addConstraint(tool, mod.constraint, param, 0.0, mod.name, sampleName, ctx.constraints);
+               elems.histoInterp.push_back(
+                  interpolationCode(mod.interpolation, InterpolationClass::Piecewise, "histosys", mod.name));
+               addSysConstraint(tool, mod.constraint, param, "histosys", mod.name, sampleName, ctx.constraints);
             },
             [&](HS3::ShapeSys const &mod) {
                const bool constrained = std::visit(
                   HS3::overloaded{[](HS3::Unconstrained) { return false; }, [](HS3::ConstantGammas) { return false; },
                                   [&](HS3::ConstraintType) { return !mod.vals.empty(); },
-                                  [](HS3::GammaConstraintPdfs const &constraints) {
-                                     return std::any_of(constraints.pdfs.begin(), constraints.pdfs.end(),
-                                                        [](auto const &pdf) { return pdf.has_value(); });
-                                  }},
+                                  [](HS3::GammaConstraintPdfs const &constraints) { return anyNamed(constraints); }},
                   mod.constraint);
                // Follow the naming of HistFactory: "<channel>_<name>_ShapeSys" for constrained and
                // "<channel>_<name>_shapeFactor" for free parameters.
                const std::string funcName =
                   ctx.channelName + "_" + mod.name + (constrained ? "_ShapeSys" : "_shapeFactor");
-               elems.shapeElems.add(createPHF(tool, funcName, mod.name, mod.parameters, mod.vals, mod.constraint,
-                                              ctx.constraints, ctx.observables, defaultShapeSysGammaMax,
-                                              minShapeUncertainty, ctx.nBins));
+               elems.shapeElems.add(
+                  createPHF(tool, funcName, mod.name, mod.parameters, mod.vals, mod.constraint, ctx.constraints,
+                            ctx.observables, defaultShapeSysGammaMax, minShapeUncertainty, dh.numEntries(),
+                            "the shapesys modifier '" + mod.name + "' of sample '" + sampleName + "'"));
             },
             [&](HS3::CustomModifier const &mod) {
                // The function can come later in the document.
@@ -719,7 +776,7 @@ public:
       std::string name(RooJSONFactoryWSTool::name(p));
       HS3::Diagnostics diagnostics;
       const HS3::InterpolatedFunction in = HS3::parseInterpolatedFunction(p, diagnostics);
-      report(name, diagnostics);
+      HS3::report(diagnostics, name);
 
       auto request = [&](std::vector<HS3::NameOrNumber> const &refs) {
          RooArgList out;
@@ -747,7 +804,7 @@ public:
       std::string name(RooJSONFactoryWSTool::name(p));
       HS3::Diagnostics diagnostics;
       const HS3::InterpolatedNumber in = HS3::parseInterpolatedNumber(p, diagnostics);
-      report(name, diagnostics);
+      HS3::report(diagnostics, name);
 
       RooArgList vars;
       for (std::string const &var : in.parameters) {
@@ -847,6 +904,19 @@ std::vector<std::string> splitTopLevelProduct(const std::string &expr)
    return parts;
 }
 
+// Expand the nested products of the constraint terms of a channel into their factors, which are the constraint terms
+// that the modifier parameters are looked up in, see findConstraint().
+void collectConstraintTerms(RooAbsPdf *pdf, std::vector<RooAbsPdf *> &terms)
+{
+   if (auto prod = dynamic_cast<RooProdPdf *>(pdf)) {
+      for (auto *factor : static_range_cast<RooAbsPdf *>(prod->pdfList())) {
+         collectConstraintTerms(factor, terms);
+      }
+   } else {
+      terms.push_back(pdf);
+   }
+}
+
 // A normsys that is written as the formula "1 +- a * b", where one of a and b is a constrained parameter.
 struct FormulaNormSys {
    RooAbsReal *param = nullptr;
@@ -854,44 +924,31 @@ struct FormulaNormSys {
    double variation = 0.0;
 };
 
-FormulaNormSys parseOverallModifierFormula(const std::string &s, RooFormulaVar *formula)
+FormulaNormSys parseOverallModifierFormula(const std::string &s, RooFormulaVar *formula,
+                                           std::vector<RooAbsPdf *> const &channelConstraints)
 {
    static const std::regex pattern(
       R"(^\s*1(?:\.0)?\s*([\+\-])\s*([a-zA-Z_][a-zA-Z0-9_]*|[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)\s*\*\s*([a-zA-Z_][a-zA-Z0-9_]*|[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?)\s*$)");
 
    FormulaNormSys sys;
    std::smatch match;
-   if (std::regex_match(s, match, pattern)) {
-      const double sign = match[1].str() == "-" ? -1.0 : 1.0;
-
-      std::string token2 = match[2].str();
-      std::string token3 = match[4].str();
-
-      RooAbsReal *p2 = static_cast<RooAbsReal *>(formula->getParameter(token2.c_str()));
-      RooAbsReal *p3 = static_cast<RooAbsReal *>(formula->getParameter(token3.c_str()));
-      RooRealVar *v2 = dynamic_cast<RooRealVar *>(p2);
-      RooRealVar *v3 = dynamic_cast<RooRealVar *>(p3);
-
-      auto *constr2 = findConstraint(v2);
-      auto *constr3 = findConstraint(v3);
-
-      if (constr2 && !p3) {
-         sys.param = p2;
-         sys.variation = sign * toDouble(token3);
-      } else if (!p2 && constr3) {
-         sys.param = p3;
-         sys.variation = sign * toDouble(token2);
-      } else if (constr2 && p3 && !constr3) {
-         sys.param = v2;
-         sys.variation = sign * p3->getVal();
-      } else if (p2 && !constr2 && constr3) {
-         sys.param = v3;
-         sys.variation = sign * p2->getVal();
-      }
-
-      // A recognized formula has exactly one constrained parameter.
-      sys.constraint = constr2 ? constr2 : constr3;
+   if (!std::regex_match(s, match, pattern)) {
+      return sys;
    }
+   // The factors a and b are parameters of the formula or numbers. A recognized formula has exactly one constrained
+   // parameter, and the value of the other factor is the variation.
+   auto *a = static_cast<RooAbsReal *>(formula->getParameter(match[2].str().c_str()));
+   auto *b = static_cast<RooAbsReal *>(formula->getParameter(match[4].str().c_str()));
+   RooAbsPdf *constraintA = findConstraint(dynamic_cast<RooRealVar *>(a), channelConstraints);
+   RooAbsPdf *constraintB = findConstraint(dynamic_cast<RooRealVar *>(b), channelConstraints);
+   if (!constraintA == !constraintB) {
+      return sys;
+   }
+   RooAbsReal *other = constraintA ? b : a;
+   const double sign = match[1].str() == "-" ? -1.0 : 1.0;
+   sys.param = constraintA ? a : b;
+   sys.constraint = constraintA ? constraintA : constraintB;
+   sys.variation = sign * (other ? other->getVal() : toDouble(match[constraintA ? 4 : 2].str()));
    return sys;
 }
 
@@ -908,12 +965,7 @@ void collectElements(RooArgList &elems, RooAbsArg *arg)
 
 bool allRooRealVar(const RooAbsCollection &list)
 {
-   for (auto *var : list) {
-      if (!dynamic_cast<RooRealVar *>(var)) {
-         return false;
-      }
-   }
-   return true;
+   return std::all_of(list.begin(), list.end(), [](RooAbsArg *arg) { return dynamic_cast<RooRealVar *>(arg); });
 }
 
 // The parameters of normsys and histosys modifiers must be variables.
@@ -934,7 +986,9 @@ std::vector<double> contents(RooDataHist const &dataHist)
 struct ExportedChannel {
    std::string name;
    HS3::HistFactoryDist dist;
-   RooArgSet const *observables = nullptr;
+   // The variables of the first histogram, named after the observables of the channel.
+   std::unique_ptr<RooArgSet> observables;
+   std::size_t nBins = 0;
    /// The pdfs that the modifiers name as constraints, by name.
    std::map<std::string, RooAbsPdf const *> constraints;
    std::vector<RooAbsReal *> customModifiers;
@@ -975,7 +1029,8 @@ std::vector<double> binVolumes(RooRealSumPdf const &sumpdf)
 /// Whether a constant factor of a sample is the inverse bin width that HistFactory before ROOT 6.26 multiplied the
 /// samples with (a constant `RooRealVar` `binWidth_<observables>_<i>` in the coefficients of the `RooRealSumPdf`).
 /// `histfactory_dist` implies this factor, so it is not written as a modifier. It is identified by its structure, not
-/// by its name: a constant that is not floating in any snapshot, used only by the sum or the products of the channel,
+/// by its name: a constant that is not floating in any snapshot, used only by the sum or the products of the channel
+/// (among the objects of the workspace),
 /// with the inverse of the volume of the first bin, or of the average bin volume, of one of the histograms of the
 /// channel as value.
 bool isLegacyBinWidthFactor(RooAbsArg const &factor, RooRealSumPdf const &sumpdf, RooArgSet const &channelNodes,
@@ -996,11 +1051,26 @@ bool isLegacyBinWidthFactor(RooAbsArg const &factor, RooRealSumPdf const &sumpdf
          }
       }
    }
+   // A channel whose observables are renamed (RooJSONFactoryWSTool::Config::renameCombinedObservables) is a clone
+   // made by RooCustomizer, which marks the cloned nodes with "ORIGNAME:<original>". The factor doesn't depend on the
+   // observables, so it is not cloned: the original sum and products of the channel are still its clients.
+   auto isOriginalOfChannelNode = [&](RooAbsArg const &client) {
+      const std::string attribute = std::string{"ORIGNAME:"} + client.GetName();
+      return sumpdf.getAttribute(attribute.c_str()) ||
+             std::any_of(channelNodes.begin(), channelNodes.end(),
+                         [&](RooAbsArg const *node) { return node->getAttribute(attribute.c_str()); });
+   };
    for (RooAbsArg const *client : factor.clients()) {
       const bool isChannelProduct = dynamic_cast<RooProduct const *>(client) && channelNodes.find(*client) == client;
-      if (client != &sumpdf && !isChannelProduct) {
-         return false;
+      if (client == &sumpdf || isChannelProduct || isOriginalOfChannelNode(*client)) {
+         continue;
       }
+      // Objects outside the workspace are no part of the model, e.g. the computation graph of a likelihood that was
+      // created from the model before the export.
+      if (ws && ws->arg(client->GetName()) != client) {
+         continue;
+      }
+      return false;
    }
    // The value was stored with 7 significant digits.
    const double value = static_cast<RooAbsReal const &>(factor).getVal();
@@ -1008,7 +1078,26 @@ bool isLegacyBinWidthFactor(RooAbsArg const &factor, RooRealSumPdf const &sumpdf
                       [&](double volume) { return volume > 0. && std::abs(value * volume - 1.) < 1e-6; });
 }
 
-ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfname, const RooRealSumPdf *sumpdf)
+/// Whether a ParamHistFunc has the structure of the one of a HistFactory ShapeSys or ShapeFactor: it is defined over
+/// the observables of the channel, with one parameter per bin of the channel. The import recreates such a function from
+/// a shapefactor modifier. Its name doesn't matter.
+bool isShapeModifierFunction(ParamHistFunc const &phf, ExportedChannel const &channel)
+{
+   if (!channel.observables || phf.paramList().size() != channel.nBins ||
+       static_cast<std::size_t>(phf.numBins()) != channel.nBins ||
+       phf.dataVars().size() != channel.observables->size()) {
+      return false;
+   }
+   for (RooAbsArg const *obs : phf.dataVars()) {
+      if (!channel.observables->find(obs->GetName())) {
+         return false;
+      }
+   }
+   return true;
+}
+
+ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfname, const RooRealSumPdf *sumpdf,
+                            std::vector<RooAbsPdf *> const &channelConstraints)
 {
    ExportedChannel channel;
 
@@ -1022,19 +1111,18 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
    sumpdf->treeNodeServerList(&channelNodes);
    const std::vector<double> volumes = binVolumes(*sumpdf);
 
-   auto constraint = [&](RooAbsPdf const *pdf) -> HS3::Constraint {
-      if (!pdf) {
-         return HS3::Unconstrained{};
-      }
-      channel.constraints.emplace(pdf->GetName(), pdf);
-      return HS3::ConstraintPdf{{pdf->GetName()}};
-   };
-   auto gammaConstraint = [&](RooAbsPdf const *pdf) -> std::optional<HS3::DistributionRef> {
-      if (!pdf) {
+   // The modifiers name only the constraint terms of the channel. A pdf of a parameter that is not, like an external
+   // constraint or a prior, stays where it is.
+   auto constraintTerm = [&](RooAbsPdf const *pdf) -> std::optional<HS3::DistributionRef> {
+      if (std::find(channelConstraints.begin(), channelConstraints.end(), pdf) == channelConstraints.end()) {
          return std::nullopt;
       }
       channel.constraints.emplace(pdf->GetName(), pdf);
       return HS3::DistributionRef{pdf->GetName()};
+   };
+   auto constraint = [&](RooAbsPdf const *pdf) -> HS3::Constraint {
+      auto ref = constraintTerm(pdf);
+      return ref ? HS3::Constraint{HS3::ConstraintPdf{*ref}} : HS3::Unconstrained{};
    };
 
    for (size_t sampleidx = 0; sampleidx < sumpdf->funcList().size(); ++sampleidx) {
@@ -1066,18 +1154,19 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
          normSys.push_back({sysname, {param.GetName()}, hi, lo, constraint(pdf), interpolation});
       };
 
-      auto updateObservables = [&](RooDataHist const &dataHist) {
+      auto updateObservables = [&](RooHistFunc const &histFunc) {
+         RooDataHist const &dataHist = histFunc.dataHist();
+         // The axes are named after the observables of the RooHistFunc, which are not necessarily the variables of
+         // its histogram (e.g. after a RooCustomizer replaced them).
+         auto varsPtr =
+            histogramVariablesNamedAfterObservables(dataHist, histFunc.getHistObsList(), histFunc.variables());
          if (channel.observables == nullptr) {
-            channel.observables = dataHist.get();
+            channel.observables = std::move(varsPtr);
+            channel.nBins = dataHist.numEntries();
          } else {
             // The bin contents of all samples are written in the order of the axes of the channel (the last axis
             // varies fastest), which is the order of the observables of the first histogram.
-            RooArgSet const &vars = *dataHist.get();
-            bool sameOrder = vars.size() == channel.observables->size();
-            for (std::size_t i = 0; sameOrder && i < vars.size(); ++i) {
-               sameOrder = std::string(vars[i]->GetName()) == (*channel.observables)[i]->GetName();
-            }
-            if (!sameOrder) {
+            if (varsPtr->size() != channel.observables->size() || !varsPtr->hasSameLayout(*channel.observables)) {
                RooJSONFactoryWSTool::error("the histograms of channel '" + channel.name +
                                            "' don't have their observables in the same order, so their bin "
                                            "contents can't be written along the same axes");
@@ -1109,21 +1198,12 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
                   normFactors.push_back({constVar->GetName(), {constVar->GetName()}, HS3::Unconstrained{}});
                }
             } else if (auto par = dynamic_cast<RooRealVar *>(e)) {
-               // Every Gaussian of the parameter is a candidate for its constraint.
-               bool isConstrained = false;
-               for (RooAbsArg const *pdf : ws->allPdfs()) {
-                  if (auto gauss = dynamic_cast<RooGaussian const *>(pdf)) {
-                     if (std::string(par->GetName()) == gauss->getX().GetName()) {
-                        normFactors.push_back({par->GetName(), {par->GetName()}, constraint(gauss)});
-                        isConstrained = true;
-                     }
-                  }
-               }
-               if (!isConstrained) {
-                  normFactors.push_back({par->GetName(), {par->GetName()}, HS3::Unconstrained{}});
-               }
+               // The constraint is found among the clients of the parameter, whichever of x and mean of a Gaussian it
+               // is.
+               normFactors.push_back(
+                  {par->GetName(), {par->GetName()}, constraint(findConstraint(par, channelConstraints))});
             } else if (auto hf = dynamic_cast<const RooHistFunc *>(e)) {
-               updateObservables(hf->dataHist());
+               updateObservables(*hf);
             } else if (ParamHistFunc *phf = dynamic_cast<ParamHistFunc *>(e); phf && allRooRealVar(phf->paramList())) {
                phfs.push_back(phf);
             } else if (auto fip = dynamic_cast<RooStats::HistFactory::FlexibleInterpVar *>(e)) {
@@ -1135,10 +1215,10 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
                   erasePrefix(sysname, "alpha_");
                   const std::string context = "normsys modifier '" + sysname + "' in sample '" + sample.name +
                                               "' of channel '" + channel.name + "'";
-                  // A parameter without constraint is unconstrained, see checkUnconstrainedModifiers().
+                  // A parameter without constraint is unconstrained.
                   addNormSys(*var, fip->high()[i], fip->low()[i],
                              interpolationFromCode(fip->interpolationCodes()[i], InterpolationClass::Flexible, context),
-                             findConstraint(var));
+                             findConstraint(var, channelConstraints));
                }
             } else if (!pip && (pip = dynamic_cast<PiecewiseInterpolation *>(e))) {
                // nothing to do here, already assigned
@@ -1168,7 +1248,7 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
                         continue;
                      }
                      // check if this is an attempt at explicitly encoding an overallSys
-                     FormulaNormSys sys = parseOverallModifierFormula(comp, formula);
+                     FormulaNormSys sys = parseOverallModifierFormula(comp, formula, channelConstraints);
                      if (sys.param) {
                         // Preserve the legacy export behaviour for recognized explicit formulae.
                         addNormSys(*sys.param, 1.0 + sys.variation, 1.0 - sys.variation,
@@ -1197,39 +1277,37 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
       collectElements(elems, sumpdf->coefList().at(sampleidx));
       processElements(elems, processElements);
 
-      // see if we can get the observables
       if (pip) {
+         // see if we can get the observables
          if (auto nh = dynamic_cast<RooHistFunc const *>(pip->nominalHist())) {
-            updateObservables(nh->dataHist());
+            updateObservables(*nh);
          }
-      }
-
-      if (pip) {
          for (size_t i = 0; i < pip->paramList().size(); ++i) {
+            auto lo = dynamic_cast<RooHistFunc *>(pip->lowList().at(i));
+            auto hi = dynamic_cast<RooHistFunc *>(pip->highList().at(i));
+            if (!lo || !hi) {
+               continue;
+            }
             RooAbsReal *var = static_cast<RooAbsReal *>(pip->paramList().at(i));
             std::string sysname(var->GetName());
             erasePrefix(sysname, "alpha_");
-            if (auto lo = dynamic_cast<RooHistFunc *>(pip->lowList().at(i))) {
-               if (auto hi = dynamic_cast<RooHistFunc *>(pip->highList().at(i))) {
-                  // A parameter without constraint is unconstrained, see checkUnconstrainedModifiers().
-                  const auto *pdf = findConstraint(var);
-                  checkModifierParameter(*var, pdf);
-                  const std::string context = "histosys modifier '" + sysname + "' in sample '" + sample.name +
-                                              "' of channel '" + channel.name + "'";
-                  histoSys.push_back(
-                     {sysname,
-                      {var->GetName()},
-                      {contents(hi->dataHist()), std::nullopt},
-                      {contents(lo->dataHist()), std::nullopt},
-                      constraint(pdf),
-                      interpolationFromCode(pip->interpolationCodes()[i], InterpolationClass::Piecewise, context)});
-               }
-            }
+            // A parameter without constraint is unconstrained.
+            const auto *pdf = findConstraint(var, channelConstraints);
+            checkModifierParameter(*var, pdf);
+            const std::string context =
+               "histosys modifier '" + sysname + "' in sample '" + sample.name + "' of channel '" + channel.name + "'";
+            histoSys.push_back(
+               {sysname,
+                {var->GetName()},
+                {contents(hi->dataHist()), std::nullopt},
+                {contents(lo->dataHist()), std::nullopt},
+                constraint(pdf),
+                interpolationFromCode(pip->interpolationCodes()[i], InterpolationClass::Piecewise, context)});
          }
       }
 
       for (ParamHistFunc *phf : phfs) {
-         if (startsWith(std::string(phf->GetName()), "mc_stat_")) { // MC stat uncertainty
+         if (startsWith(phf->GetName(), "mc_stat_")) { // MC stat uncertainty
             statError.emplace();
             statError->name = "staterror";
             HS3::GammaConstraintPdfs pdfs;
@@ -1238,16 +1316,32 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
             for (RooAbsReal *g : paramHistFuncParamsInBinOrder(*phf)) {
                statError->parameters.push_back({g->GetName()});
                ++idx;
-               RooAbsPdf *pdf = findConstraint(g);
-               pdfs.pdfs.push_back(gammaConstraint(pdf));
+               RooAbsPdf *pdf = findConstraint(g, channelConstraints);
+               pdfs.pdfs.push_back(constraintTerm(pdf));
                channel.totYield[idx] += sample.contents[idx - 1];
                channel.totYield2[idx] += (sample.contents[idx - 1] * sample.contents[idx - 1]);
                if (pdf) {
                   channel.relErrors[idx] = constraintRelError(*pdf, *g);
                }
             }
-            statError->constraint = std::move(pdfs);
+            if (anyNamed(pdfs)) {
+               statError->constraint = std::move(pdfs);
+            }
          } else { // ShapeSys or ShapeFactor
+            // Other ParamHistFuncs can't be written as shapefactors: the import would recreate the function over the
+            // observables and bins of the channel. Over other variables, they are written as custom modifiers, which
+            // refer to the function by name. Over the observables of the channel with another binning, they can't be
+            // written at all, since the observables can only have one binning on import.
+            if (!isShapeModifierFunction(*phf, channel)) {
+               if (channel.observables && phf->dataVars().overlaps(*channel.observables)) {
+                  RooJSONFactoryWSTool::error("cannot write the ParamHistFunc '" + std::string(phf->GetName()) +
+                                              "': it has another binning of the observables of channel '" +
+                                              channel.name + "'");
+               }
+               custom.push_back({phf->GetName()});
+               channel.customModifiers.push_back(phf);
+               continue;
+            }
             HS3::ShapeSys &sys = shapeSys.emplace_back();
             sys.name = phf->GetName();
             erasePrefix(sys.name, channel.name + "_");
@@ -1261,12 +1355,14 @@ ExportedChannel readChannel(RooJSONFactoryWSTool *tool, const std::string &pdfna
             HS3::GammaConstraintPdfs pdfs;
             for (RooAbsReal *g : paramHistFuncParamsInBinOrder(*phf)) {
                sys.parameters.push_back({g->GetName()});
-               RooAbsPdf *pdf = findConstraint(g);
+               RooAbsPdf *pdf = findConstraint(g, channelConstraints);
                if (!pdf)
                   pdf = ws->pdf(constraintName(g->GetName()));
-               pdfs.pdfs.push_back(gammaConstraint(pdf));
+               pdfs.pdfs.push_back(constraintTerm(pdf));
             }
-            sys.constraint = std::move(pdfs);
+            if (anyNamed(pdfs)) {
+               sys.constraint = std::move(pdfs);
+            }
          }
       }
 
@@ -1316,54 +1412,131 @@ void configureStatError(ExportedChannel &channel)
    }
 }
 
-// The modifiers name only the constraint terms of the channel. A pdf of a parameter that is not, like an external
-// constraint or a prior, stays where it is. Returns the named constraint terms.
-std::set<RooAbsPdf const *>
-nameChannelConstraints(ExportedChannel &channel, std::vector<RooAbsPdf *> const &constraints)
+// The RooRealSumPdf of a product of exactly one RooRealSumPdf and other pdfs, or null for anything else. Such a product
+// has the form that the HistFactory exporter writes as a histfactory_dist with its constraint terms.
+RooRealSumPdf const *channelSum(RooAbsArg const &pdf)
 {
-   std::set<RooAbsPdf const *> named;
-   auto isNamed = [&](std::string const &name) {
-      RooAbsPdf const *pdf = channel.constraints.at(name);
-      if (std::find(constraints.begin(), constraints.end(), pdf) == constraints.end()) {
+   auto const *prod = dynamic_cast<RooProdPdf const *>(&pdf);
+   if (!prod) {
+      return nullptr;
+   }
+   RooRealSumPdf const *sum = nullptr;
+   for (RooAbsArg const *factor : prod->pdfList()) {
+      if (auto const *factorSum = dynamic_cast<RooRealSumPdf const *>(factor)) {
+         if (sum) {
+            return nullptr;
+         }
+         sum = factorSum;
+      }
+   }
+   return sum;
+}
+
+// Whether the constraint `constraint` can be written as an array component: every object of the workspace that uses
+// it is a HistFactory channel, which refers to it through its modifiers, or an array distribution. Any other user,
+// e.g. an ordinary product or a ModelConfig that has it as an external constraint, refers to the constraint by its
+// own name, which an array component doesn't have. The decision only depends on the workspace, not on the order in
+// which the export visits the objects.
+bool usedOnlyByHistFactoryChannels(RooJSONFactoryWSTool &tool, RooAbsPdf const &constraint)
+{
+   for (TObject const *obj : tool.workspace()->allGenericObjects()) {
+      auto const *mc = dynamic_cast<RooFit::ModelConfig const *>(obj);
+      if (mc && mc->GetExternalConstraints() && mc->GetExternalConstraints()->find(constraint.GetName())) {
          return false;
       }
-      named.insert(pdf);
-      return true;
-   };
-   auto filter = [&](HS3::Constraint &constraint) {
-      auto const *pdf = std::get_if<HS3::ConstraintPdf>(&constraint);
-      if (pdf && !isNamed(pdf->pdf.name)) {
-         constraint = HS3::Unconstrained{};
+   }
+   for (RooAbsArg const *client : constraint.clients()) {
+      if (tool.workspace()->arg(client->GetName()) != client) {
+         continue; // not part of what is exported
       }
-   };
-   auto filterGammas = [&](HS3::GammaConstraint &constraint) {
-      auto *pdfs = std::get_if<HS3::GammaConstraintPdfs>(&constraint);
-      if (!pdfs) {
-         return;
+      if (!client->getAttribute(arrayDistTag) && !channelSum(*client)) {
+         return false;
       }
-      bool any = false;
-      for (auto &pdf : pdfs->pdfs) {
-         if (pdf && !isNamed(pdf->name)) {
-            pdf.reset();
+   }
+   return true;
+}
+
+// Register the constraint `constraint` of a modifier parameter for the export and return the name under which it is
+// written. Constraints are collected into one array distribution per type and top-level pdf (or, if the constraint
+// already belongs to an array distribution, that one), unless the arrays are switched off, the constraint cannot be
+// a component, or it is used by objects other than HistFactory channels. In those cases it is written on its own.
+std::string exportConstraint(RooJSONFactoryWSTool &tool, RooAbsPdf const &constraint)
+{
+   if (RooJSONFactoryWSTool::config().exportArrayDist && usedOnlyByHistFactoryChannels(tool, constraint)) {
+      if (auto info = arrayComponentInfo(constraint)) {
+         std::string arrayName;
+         for (RooAbsArg const *client : constraint.clients()) {
+            if (client->getAttribute(arrayDistTag)) {
+               arrayName = client->GetName();
+               break;
+            }
          }
-         any = any || pdf;
+         if (arrayName.empty()) {
+            // "poisson_continuous_dist" -> "<root>_poisson_continuous_constraints"
+            arrayName = tool.exportRootName() + "_" + removeSuffix(info->type, "_dist") + "_constraints";
+         }
+         return tool.exportAsArrayComponent(constraint, arrayName);
       }
-      // Nothing is written if all parameters are unconstrained.
-      if (!any) {
-         constraint = HS3::Unconstrained{};
+   }
+   tool.queueExport(constraint);
+   return constraint.GetName();
+}
+
+// Export the constraints that the modifiers name, in the order in which the modifiers are written, and replace their
+// names by the names under which they are written: an array distribution that holds them, or their own name. Returns
+// these terms, for the likelihoods of the models that contain this channel.
+std::vector<std::string> exportNamedConstraints(RooJSONFactoryWSTool &tool, ExportedChannel &channel)
+{
+   std::map<std::string, std::string> writtenAs;
+   std::vector<std::string> terms;
+   RooWorkspace &ws = *tool.workspace();
+   auto rename = [&](std::string &name, std::string const &paramName) {
+      auto found = writtenAs.find(name);
+      if (found == writtenAs.end()) {
+         RooAbsPdf const &constraint = *channel.constraints.at(name);
+         // HistFactory builds the Gaussian constraints with the parameter as x and the global observable as mean.
+         // The observable is the side that does not depend on the parameter; recording it makes the Gaussian be
+         // written with the observable as x.
+         RooAbsArg const *param = ws.arg(paramName);
+         if (auto const *gauss = dynamic_cast<RooGaussian const *>(&constraint); gauss && param) {
+            RooAbsReal const &observable = gauss->getX().dependsOn(*param) ? gauss->getMean() : gauss->getX();
+            if (!isLiteralConstVar(observable)) {
+               tool.setConstraintObservable(constraint, observable.GetName());
+            }
+         }
+         found = writtenAs.emplace(name, exportConstraint(tool, constraint)).first;
+         if (std::find(terms.begin(), terms.end(), found->second) == terms.end()) {
+            terms.push_back(found->second);
+         }
+      }
+      name = found->second;
+   };
+   auto renameConstraint = [&](HS3::Constraint &constraint, HS3::ParameterRef const &param) {
+      if (auto *pdf = std::get_if<HS3::ConstraintPdf>(&constraint)) {
+         rename(pdf->pdf.name, param.name);
+      }
+   };
+   auto renameGammas = [&](HS3::GammaConstraint &constraint, std::vector<HS3::ParameterRef> const &params) {
+      if (auto *pdfs = std::get_if<HS3::GammaConstraintPdfs>(&constraint)) {
+         for (std::size_t i = 0; i < pdfs->pdfs.size(); ++i) {
+            if (auto &pdf = pdfs->pdfs[i]) {
+               rename(pdf->name, i < params.size() ? params[i].name : std::string{});
+            }
+         }
       }
    };
    for (HS3::Sample &sample : channel.dist.samples) {
       for (HS3::Modifier &modifier : sample.modifiers) {
-         std::visit(HS3::overloaded{
-                       [&](HS3::NormFactor &m) { filter(m.constraint); },
-                       [&](HS3::NormSys &m) { filter(m.constraint); }, [&](HS3::HistoSys &m) { filter(m.constraint); },
-                       [&](HS3::ShapeSys &m) { filterGammas(m.constraint); },
-                       [&](HS3::StatError &m) { filterGammas(m.constraint); }, [](HS3::CustomModifier &) {}},
+         std::visit(HS3::overloaded{[&](HS3::NormFactor &m) { renameConstraint(m.constraint, m.parameter); },
+                                    [&](HS3::NormSys &m) { renameConstraint(m.constraint, m.parameter); },
+                                    [&](HS3::HistoSys &m) { renameConstraint(m.constraint, m.parameter); },
+                                    [&](HS3::ShapeSys &m) { renameGammas(m.constraint, m.parameters); },
+                                    [&](HS3::StatError &m) { renameGammas(m.constraint, m.parameters); },
+                                    [](HS3::CustomModifier &) {}},
                     modifier);
       }
    }
-   return named;
+   return terms;
 }
 
 bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname, const RooRealSumPdf *sumpdf,
@@ -1380,7 +1553,7 @@ bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname
       }
    }
 
-   ExportedChannel channel = readChannel(tool, pdfname, sumpdf);
+   ExportedChannel channel = readChannel(tool, pdfname, sumpdf, constraints);
    HS3::HistFactoryDist &dist = channel.dist;
 
    // sanity checks
@@ -1402,10 +1575,7 @@ bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname
       dist.axes.push_back(HS3::toBinnedAxis(*obs));
    }
 
-   std::set<RooAbsPdf const *> namedConstraints = nameChannelConstraints(channel, constraints);
-   for (RooAbsPdf const *pdf : namedConstraints) {
-      tool->queueExport(*pdf);
-   }
+   tool->recordConstraintTerms(pdfname, exportNamedConstraints(*tool, channel));
 
    for (RooAbsReal *modifier : channel.customModifiers) {
       tool->queueExport(*modifier);
@@ -1416,10 +1586,10 @@ bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname
 
    // Export all model parameters
    RooArgSet parameters;
-   sumpdf->getParameters(channel.observables, parameters);
+   sumpdf->getParameters(channel.observables.get(), parameters);
    for (RooAbsArg *param : parameters) {
       // This should exclude the global observables. The legacy inverse bin widths are not written at all.
-      if (!startsWith(std::string{param->GetName()}, "nom_") && !channel.legacyBinWidthFactors.count(param)) {
+      if (!startsWith(param->GetName(), "nom_") && !channel.legacyBinWidthFactors.count(param)) {
          tool->queueExport(*param);
       }
    }
@@ -1427,7 +1597,7 @@ bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname
    // All other constraint terms of the channel are written separately.
    std::vector<HS3::DistributionRef> channelConstraintNames;
    for (RooAbsPdf const *pdf : constraints) {
-      if (!namedConstraints.count(pdf)) {
+      if (!channel.constraints.count(pdf->GetName())) {
          tool->queueExport(*pdf);
          channelConstraintNames.push_back({pdf->GetName()});
       }
@@ -1437,57 +1607,29 @@ bool tryExportHistFactory(RooJSONFactoryWSTool *tool, const std::string &pdfname
    return true;
 }
 
-class HistFactoryStreamer_ProdPdf : public RooFit::JSONIO::Exporter {
+// Writes a RooRealSumPdf, or the product of one with its constraint terms, as a histfactory_dist.
+class HistFactoryStreamer : public RooFit::JSONIO::Exporter {
 public:
    bool autoExportDependants() const override { return false; }
-   bool tryExport(RooJSONFactoryWSTool *tool, const RooProdPdf *prodpdf) const
+   std::string const &key() const override
    {
+      static const std::string keystring = "histfactory_dist";
+      return keystring;
+   }
+   bool exportObject(RooJSONFactoryWSTool *tool, const RooAbsArg *p, JSONNode &) const override
+   {
+      auto const *sumpdf = dynamic_cast<RooRealSumPdf const *>(p);
       std::vector<RooAbsPdf *> constraints;
-      RooRealSumPdf *sumpdf = nullptr;
-      for (auto *pdf : static_range_cast<RooAbsPdf *>(prodpdf->pdfList())) {
-         auto thispdf = dynamic_cast<RooRealSumPdf *>(pdf);
-         if (thispdf) {
-            if (!sumpdf) {
-               sumpdf = thispdf;
-            } else {
-               return false;
+      if (auto const *prodpdf = dynamic_cast<RooProdPdf const *>(p)) {
+         sumpdf = channelSum(*prodpdf);
+         for (auto *pdf : static_range_cast<RooAbsPdf *>(prodpdf->pdfList())) {
+            if (pdf != sumpdf) {
+               // The constraint terms can also be grouped in nested products.
+               collectConstraintTerms(pdf, constraints);
             }
-         } else {
-            constraints.push_back(pdf);
          }
       }
-      if (!sumpdf)
-         return false;
-
-      return tryExportHistFactory(tool, prodpdf->GetName(), sumpdf, constraints);
-   }
-   std::string const &key() const override
-   {
-      static const std::string keystring = "histfactory_dist";
-      return keystring;
-   }
-   bool exportObject(RooJSONFactoryWSTool *tool, const RooAbsArg *p, JSONNode &) const override
-   {
-      return tryExport(tool, static_cast<const RooProdPdf *>(p));
-   }
-};
-
-class HistFactoryStreamer_SumPdf : public RooFit::JSONIO::Exporter {
-public:
-   bool autoExportDependants() const override { return false; }
-   bool tryExport(RooJSONFactoryWSTool *tool, const RooRealSumPdf *sumpdf) const
-   {
-      std::vector<RooAbsPdf *> constraints;
-      return tryExportHistFactory(tool, sumpdf->GetName(), sumpdf, constraints);
-   }
-   std::string const &key() const override
-   {
-      static const std::string keystring = "histfactory_dist";
-      return keystring;
-   }
-   bool exportObject(RooJSONFactoryWSTool *tool, const RooAbsArg *p, JSONNode &) const override
-   {
-      return tryExport(tool, static_cast<const RooRealSumPdf *>(p));
+      return tryExportHistFactory(tool, p->GetName(), sumpdf, constraints);
    }
 };
 
@@ -1499,8 +1641,8 @@ STATIC_EXECUTE([]() {
    registerImporter<FlexibleInterpVarFactory>("interpolation0d", true);
    registerExporter<FlexibleInterpVarStreamer>(RooStats::HistFactory::FlexibleInterpVar::Class(), true);
    registerExporter<PiecewiseInterpolationStreamer>(PiecewiseInterpolation::Class(), true);
-   registerExporter<HistFactoryStreamer_ProdPdf>(RooProdPdf::Class(), true);
-   registerExporter<HistFactoryStreamer_SumPdf>(RooRealSumPdf::Class(), true);
+   registerExporter<HistFactoryStreamer>(RooProdPdf::Class(), true);
+   registerExporter<HistFactoryStreamer>(RooRealSumPdf::Class(), true);
 });
 
 } // namespace
@@ -1545,33 +1687,22 @@ void RooFit::HS3::buildHistFactoryDist(RooJSONFactoryWSTool &tool, std::string c
    std::string channelName = name;
    erasePrefix(channelName, "model_");
 
-   std::size_t nBins = 1;
-   for (auto const &axis : dist.axes) {
-      nBins *= std::visit(overloaded{[](RegularBinning const &b) { return static_cast<std::size_t>(b.nbins); },
-                                     [](EdgesBinning const &b) { return b.edges.size() - 1; }},
-                          axis.binning);
-   }
-
    RooAbsArg *mcStatObject = nullptr;
    RooArgSet constraints;
    if (!sumW.empty()) {
+      // The relative uncertainties. The gammas of bins without a positive yield are set constant later.
       std::vector<double> errs(sumW.size());
       for (std::size_t i = 0; i < sumW.size(); ++i) {
-         if (sumW[i] == 0.) {
-            errs[i] = 0.;
-            continue;
-         }
-         errs[i] = std::sqrt(sumW2[i]) / sumW[i];
-         // avoid negative sigma. This NP will be set constant anyway later
-         errs[i] = std::max(errs[i], 0.);
+         errs[i] = sumW[i] > 0. ? std::sqrt(sumW2[i]) / sumW[i] : 0.;
       }
 
-      mcStatObject = &createPHF(tool, "mc_stat_" + channelName, "stat_" + channelName, gammaParnames, errs,
-                                statErrorConstraint(dist), constraints, observables, defaultStatErrorGammaMax,
-                                dist.statError.relThreshold, nBins);
+      mcStatObject =
+         &createPHF(tool, "mc_stat_" + channelName, "stat_" + channelName, gammaParnames, errs,
+                    statErrorConstraint(dist), constraints, observables, defaultStatErrorGammaMax,
+                    dist.statError.relThreshold, errs.size(), "the staterror modifier of channel '" + name + "'");
    }
 
-   ChannelContext ctx{tool, dist, observables, name, channelName, nBins, mcStatObject, constraints};
+   ChannelContext ctx{tool, dist, observables, name, channelName, mcStatObject, constraints};
 
    RooArgList funcs;
    RooArgList coefs;
@@ -1584,29 +1715,19 @@ void RooFit::HS3::buildHistFactoryDist(RooJSONFactoryWSTool &tool, std::string c
 
    if (channelConstraints) {
       for (auto const &ref : *channelConstraints) {
-         RooAbsPdf *pdf = findNamedConstraint(tool, ref.name, name);
-         if (!pdf) {
-            RooJSONFactoryWSTool::error("unable to find the constraint '" + ref.name + "' of '" + name + "'");
-         }
-         constraints.add(*pdf);
+         constraints.add(*tool.request<RooAbsPdf>(ref.name, name));
       }
    }
 
+   // With constraints, the channel is the product of the sum of the samples and the constraints.
+   auto &sum = tool.wsEmplace<RooRealSumPdf>(constraints.empty() ? name : channelName + "_model", funcs, coefs, true);
+   sum.SetTitle(name.c_str());
    // A histfactory_dist is a product of Poisson distributions of the bin counts. RooFit's binned likelihood
    // computes exactly that (it differs from the event-wise likelihood only by a constant), and binned generation
    // generates bin counts, so both are enabled, as HistFactory does by default.
-   auto enableBinned = [](RooRealSumPdf &sum) {
-      sum.setAttribute("BinnedLikelihood");
-      sum.setAttribute("GenerateBinned");
-   };
-   if (constraints.empty()) {
-      enableBinned(tool.wsEmplace<RooRealSumPdf>(name, funcs, coefs, true));
-   } else {
-      std::string sumName = name + "_model";
-      erasePrefix(sumName, "model_");
-      auto &sum = tool.wsEmplace<RooRealSumPdf>(sumName, funcs, coefs, true);
-      sum.SetTitle(name.c_str());
-      enableBinned(sum);
+   sum.setAttribute("BinnedLikelihood");
+   sum.setAttribute("GenerateBinned");
+   if (!constraints.empty()) {
       tool.wsEmplace<RooProdPdf>(name, constraints, RooFit::Conditional(sum, observables));
    }
 }
@@ -1617,22 +1738,19 @@ bool RooFit::HS3::isBuiltinHistFactoryImporter(RooFit::JSONIO::Importer const &i
 }
 
 // The upgrade rewrites the JSON, so it has to work on a copy.
-void RooFit::HS3::importHistFactoryNode(RooJSONFactoryWSTool &tool, JSONNode const &p,
+void RooFit::HS3::importHistFactoryNode(RooJSONFactoryWSTool &tool, JSONNode const &node,
                                         std::vector<DistributionRef> const *channelConstraints)
 {
-   std::string name = RooJSONFactoryWSTool::name(p);
-   if (!p.has_child("samples")) {
+   std::string name = RooJSONFactoryWSTool::name(node);
+   if (!node.has_child("samples")) {
       RooJSONFactoryWSTool::error("no samples in '" + name + "', skipping.");
    }
    std::stringstream ss;
-   p.writeJSON(ss);
+   node.writeJSON(ss);
    std::unique_ptr<RooFit::Detail::JSONTree> tree = RooFit::Detail::JSONTree::create(ss.str());
 
-   HS3::Version version;
-   HS3::parseVersion(tool.hs3VersionInput(), version);
-
    HS3::Diagnostics diagnostics;
-   HS3::upgradeHistFactoryDist(tree->rootnode(), version, diagnostics);
+   HS3::upgradeHistFactoryDist(tree->rootnode(), tool.hs3Version(), diagnostics);
    HS3::HistFactoryDist dist = HS3::parseHistFactoryDist(tree->rootnode(), diagnostics);
    if (!HS3::hasErrors(diagnostics)) {
       HS3::validateHistFactoryDist(dist, name, diagnostics);

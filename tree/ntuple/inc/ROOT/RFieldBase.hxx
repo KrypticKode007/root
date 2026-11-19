@@ -20,6 +20,7 @@
 #include <ROOT/RFieldUtils.hxx>
 #include <ROOT/RNTupleRange.hxx>
 #include <ROOT/RNTupleTypes.hxx>
+#include <ROOT/RNTupleUtils.hxx>
 
 #include <atomic>
 #include <cassert>
@@ -53,6 +54,7 @@ class RPageSink;
 class RPageSource;
 struct RFieldCallbackInjector;
 struct RFieldRepresentationModifier;
+struct RNTupleAttrEntry;
 
 // TODO(jblomer): find a better way to not have these methods in the RFieldBase public API
 void CallFlushColumnsOnField(RFieldBase &);
@@ -63,8 +65,30 @@ ROOT::RResult<std::unique_ptr<ROOT::RFieldBase>>
 CallFieldBaseCreate(const std::string &fieldName, const std::string &typeName, const ROOT::RCreateFieldOptions &options,
                     const ROOT::RNTupleDescriptor *desc, ROOT::DescriptorId_t fieldId);
 void CallSetArtificialOnField(RFieldBase &);
+std::shared_ptr<RStringPool> CallSetSharedStringPoolOnField(const std::shared_ptr<Internal::RStringPool> &);
+std::shared_ptr<RStringPool> GetStringPoolOfField(const ROOT::RFieldBase &);
 
-struct RNTupleAttrEntry;
+/// Set a common string pool for all field (hierarchies) created in a block
+class RFieldSharedStringPoolRaii {
+private:
+   std::shared_ptr<RStringPool> fOldPool;
+
+public:
+   RFieldSharedStringPoolRaii()
+   {
+      fOldPool = CallSetSharedStringPoolOnField(std::make_shared<Internal::RStringPool>());
+   }
+   explicit RFieldSharedStringPoolRaii(std::shared_ptr<Internal::RStringPool> pool)
+   {
+      fOldPool = CallSetSharedStringPoolOnField(pool);
+   }
+   RFieldSharedStringPoolRaii(const RFieldSharedStringPoolRaii &other) = delete;
+   RFieldSharedStringPoolRaii(RFieldSharedStringPoolRaii &&other) = delete;
+   RFieldSharedStringPoolRaii &operator=(const RFieldSharedStringPoolRaii &other) = delete;
+   RFieldSharedStringPoolRaii &operator=(RFieldSharedStringPoolRaii &&other) = delete;
+   ~RFieldSharedStringPoolRaii() { CallSetSharedStringPoolOnField(fOldPool); }
+};
+
 } // namespace Internal
 
 // clang-format off
@@ -97,6 +121,9 @@ class RFieldBase {
                                  const ROOT::RCreateFieldOptions &options, const ROOT::RNTupleDescriptor *desc,
                                  ROOT::DescriptorId_t fieldId);
    friend void Internal::CallSetArtificialOnField(RFieldBase &);
+   friend std::shared_ptr<Internal::RStringPool>
+   Internal::CallSetSharedStringPoolOnField(const std::shared_ptr<Internal::RStringPool> &);
+   friend std::shared_ptr<Internal::RStringPool> ROOT::Internal::GetStringPoolOfField(const ROOT::RFieldBase &);
 
    using ReadCallback_t = std::function<void(void *)>;
 
@@ -227,10 +254,19 @@ public:
    class RBulkValues;
 
 private:
+   /// Set by the SharedStringPoolRaii object to a pre-existing string pool used during all field constructions.
+   /// A string pool must not be shared among threads.
+   static thread_local std::shared_ptr<Internal::RStringPool> fgSharedStringPool;
+   /// The string storage for name, type (alias), and description. The string pool is always shared with the subfields.
+   std::shared_ptr<Internal::RStringPool> fStringPool;
    /// The field name relative to its parent field
-   std::string fName;
+   const std::string *fFieldName = nullptr;
    /// The C++ type captured by this field
-   std::string fType;
+   const std::string *fTypeName = nullptr;
+   /// A typedef or using name that was used when creating the field
+   const std::string *fTypeAlias = nullptr;
+   /// Free text set by the user
+   const std::string *fDescription = nullptr;
    /// The role of this field in the data model structure
    ROOT::ENTupleStructure fStructure;
    /// For fixed sized arrays, the array length
@@ -246,10 +282,11 @@ private:
    /// corresponding RNTuple descriptor. This on-disk ID is set in RPageSink::Create() for writing and by
    /// RFieldDescriptor::CreateField() when recreating a field / model from the stored descriptor.
    ROOT::DescriptorId_t fOnDiskId = ROOT::kInvalidDescriptorId;
-   /// Free text set by the user
-   std::string fDescription;
    /// Changed by ConnectTo[Sink,Source], reset by Clone()
    EState fState = EState::kUnconnected;
+
+   /// Used by the SharedStringPoolRaii
+   static std::shared_ptr<Internal::RStringPool> SetSharedStringPool(const std::shared_ptr<Internal::RStringPool> &);
 
    void InvokeReadCallbacks(void *target)
    {
@@ -291,6 +328,8 @@ private:
       }
    }
 
+   void SetStringPool(const std::shared_ptr<Internal::RStringPool> &pool);
+
 protected:
    struct RBulkSpec;
 
@@ -327,8 +366,6 @@ protected:
    std::vector<std::unique_ptr<ROOT::Internal::RColumn>> fAvailableColumns;
    /// Properties of the type that allow for optimizations of collections of that type
    std::uint32_t fTraits = 0;
-   /// A typedef or using name that was used when creating the field
-   std::string fTypeAlias;
    /// List of functions to be called after reading a value
    std::vector<ReadCallback_t> fReadCallbacks;
    /// C++ type version cached from the descriptor after a call to ConnectPageSource()
@@ -347,25 +384,37 @@ protected:
    /// Helpers for generating columns. We use the fact that most fields have the same C++/memory types
    /// for all their column representations.
    /// Where possible, we call the helpers not from the header to reduce compilation time.
-   template <std::uint32_t ColumnIndexT, typename HeadT, typename... TailTs>
+   template <Internal::RColumn::EColumnType ColumnTypeT, std::uint32_t ColumnIndexT, typename HeadT, typename... TailTs>
    void GenerateColumnsImpl(const ColumnRepresentation_t &representation, std::uint16_t representationIndex)
    {
       assert(ColumnIndexT < representation.size());
-      auto &column = fAvailableColumns.emplace_back(
-         ROOT::Internal::RColumn::Create<HeadT>(representation[ColumnIndexT], ColumnIndexT, representationIndex));
+      Internal::RColumn *column = nullptr;
+      static_assert(ColumnTypeT == Internal::RColumn::EColumnType::kRead ||
+                    ColumnTypeT == Internal::RColumn::EColumnType::kWrite);
+      if constexpr (ColumnTypeT == Internal::RColumn::EColumnType::kRead) {
+         column = fAvailableColumns
+                     .emplace_back(Internal::RReadColumn::Create<HeadT>(representation[ColumnIndexT], ColumnIndexT,
+                                                                        representationIndex))
+                     .get();
+      } else {
+         column = fAvailableColumns
+                     .emplace_back(Internal::RWriteColumn::Create<HeadT>(representation[ColumnIndexT], ColumnIndexT,
+                                                                         representationIndex))
+                     .get();
+      }
 
       // Initially, the first two columns become the active column representation
       if (representationIndex == 0 && !fPrincipalColumn) {
-         fPrincipalColumn = column.get();
+         fPrincipalColumn = column;
       } else if (representationIndex == 0 && !fAuxiliaryColumn) {
-         fAuxiliaryColumn = column.get();
+         fAuxiliaryColumn = column;
       } else {
          // We currently have no fields with more than 2 columns in its column representation
          R__ASSERT(representationIndex > 0);
       }
 
       if constexpr (sizeof...(TailTs))
-         GenerateColumnsImpl<ColumnIndexT + 1, TailTs...>(representation, representationIndex);
+         GenerateColumnsImpl<ColumnTypeT, ColumnIndexT + 1, TailTs...>(representation, representationIndex);
    }
 
    /// For writing, use the currently set column representative
@@ -374,12 +423,14 @@ protected:
    {
       if (fColumnRepresentatives.empty()) {
          fAvailableColumns.reserve(sizeof...(ColumnCppTs));
-         GenerateColumnsImpl<0, ColumnCppTs...>(GetColumnRepresentations().GetSerializationDefault(), 0);
+         GenerateColumnsImpl<Internal::RColumn::EColumnType::kWrite, 0, ColumnCppTs...>(
+            GetColumnRepresentations().GetSerializationDefault(), 0);
       } else {
          const auto N = fColumnRepresentatives.size();
          fAvailableColumns.reserve(N * sizeof...(ColumnCppTs));
          for (unsigned i = 0; i < N; ++i) {
-            GenerateColumnsImpl<0, ColumnCppTs...>(fColumnRepresentatives[i].get(), i);
+            GenerateColumnsImpl<Internal::RColumn::EColumnType::kWrite, 0, ColumnCppTs...>(
+               fColumnRepresentatives[i].get(), i);
          }
       }
    }
@@ -393,12 +444,13 @@ protected:
          const auto &onDiskTypes = EnsureCompatibleColumnTypes(desc, representationIndex);
          if (onDiskTypes.empty())
             break;
-         GenerateColumnsImpl<0, ColumnCppTs...>(onDiskTypes, representationIndex);
+         GenerateColumnsImpl<Internal::RColumn::EColumnType::kRead, 0, ColumnCppTs...>(onDiskTypes,
+                                                                                       representationIndex);
          fColumnRepresentatives.emplace_back(onDiskTypes);
          if (representationIndex > 0) {
             for (std::size_t i = 0; i < sizeof...(ColumnCppTs); ++i) {
-               fAvailableColumns[i]->MergeTeams(
-                  *fAvailableColumns[representationIndex * sizeof...(ColumnCppTs) + i].get());
+               fAvailableColumns[i]->ForReading()->MergeTeams(
+                  *(fAvailableColumns[representationIndex * sizeof...(ColumnCppTs) + i]->ForReading()));
             }
          }
          representationIndex++;
@@ -457,11 +509,11 @@ protected:
    void Read(ROOT::NTupleSize_t globalIndex, void *to)
    {
       if (fIsSimple)
-         return (void)fPrincipalColumn->Read(globalIndex, to);
+         return (void)fPrincipalColumn->ForReading()->Read(globalIndex, to);
 
       if (!fIsArtificial) {
          if (fTraits & kTraitMappable)
-            fPrincipalColumn->Read(globalIndex, to);
+            fPrincipalColumn->ForReading()->Read(globalIndex, to);
          else
             ReadGlobalImpl(globalIndex, to);
       }
@@ -475,11 +527,11 @@ protected:
    void Read(RNTupleLocalIndex localIndex, void *to)
    {
       if (fIsSimple)
-         return (void)fPrincipalColumn->Read(localIndex, to);
+         return (void)fPrincipalColumn->ForReading()->Read(localIndex, to);
 
       if (!fIsArtificial) {
          if (fTraits & kTraitMappable)
-            fPrincipalColumn->Read(localIndex, to);
+            fPrincipalColumn->ForReading()->Read(localIndex, to);
          else
             ReadInClusterImpl(localIndex, to);
       }
@@ -522,6 +574,9 @@ protected:
    // type information. This has to happen at the end of writing because the type information may change depending
    // on the data that's written, e.g. for polymorphic types in the streamer field.
    virtual ROOT::RExtraTypeInfoDescriptor GetExtraTypeInfo() const { return ROOT::RExtraTypeInfoDescriptor(); }
+
+   /// Can only be set on unconnected fields
+   void SetTypeAlias(std::string_view typeAlias);
 
    /// Add a new subfield to the list of nested fields. Throws an exception if childName is non-empty and the passed
    /// field has a different name.
@@ -644,11 +699,11 @@ public:
    std::uint32_t GetTraits() const { return fTraits; }
    bool HasReadCallbacks() const { return !fReadCallbacks.empty(); }
 
-   const std::string &GetFieldName() const { return fName; }
+   const std::string &GetFieldName() const { return *fFieldName; }
    /// Returns the field name and parent field names separated by dots (`grandparent.parent.child`)
    std::string GetQualifiedFieldName() const;
-   const std::string &GetTypeName() const { return fType; }
-   const std::string &GetTypeAlias() const { return fTypeAlias; }
+   const std::string &GetTypeName() const { return *fTypeName; }
+   const std::string &GetTypeAlias() const { return *fTypeAlias; }
    ROOT::ENTupleStructure GetStructure() const { return fStructure; }
    std::size_t GetNRepetitions() const { return fNRepetitions; }
    const RFieldBase *GetParent() const { return fParent; }
@@ -657,7 +712,7 @@ public:
    bool IsSimple() const { return fIsSimple; }
    bool IsArtificial() const { return fIsArtificial; }
    /// Get the field's description
-   const std::string &GetDescription() const { return fDescription; }
+   const std::string &GetDescription() const { return *fDescription; }
    void SetDescription(std::string_view description);
    EState GetState() const { return fState; }
 

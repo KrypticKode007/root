@@ -89,6 +89,15 @@ void ROOT::Internal::CallSetArtificialOnField(RFieldBase &field)
 {
    field.SetArtificial();
 }
+std::shared_ptr<ROOT::Internal::RStringPool>
+ROOT::Internal::CallSetSharedStringPoolOnField(const std::shared_ptr<Internal::RStringPool> &pool)
+{
+   return RFieldBase::SetSharedStringPool(pool);
+}
+std::shared_ptr<ROOT::Internal::RStringPool> ROOT::Internal::GetStringPoolOfField(const ROOT::RFieldBase &field)
+{
+   return field.fStringPool;
+}
 
 ROOT::RResult<std::unique_ptr<ROOT::RFieldBase>>
 ROOT::Internal::CallFieldBaseCreate(const std::string &fieldName, const std::string &typeName,
@@ -239,11 +248,11 @@ ROOT::RFieldBase::CreateObject<void>() const
 
 //------------------------------------------------------------------------------
 
+thread_local std::shared_ptr<ROOT::Internal::RStringPool> ROOT::RFieldBase::fgSharedStringPool;
+
 ROOT::RFieldBase::RFieldBase(std::string_view name, std::string_view type, ROOT::ENTupleStructure structure,
                              bool isSimple, std::size_t nRepetitions)
-   : fName(name),
-     fType(type),
-     fStructure(structure),
+   : fStructure(structure),
      fNRepetitions(nRepetitions),
      fIsSimple(isSimple),
      fParent(nullptr),
@@ -251,6 +260,11 @@ ROOT::RFieldBase::RFieldBase(std::string_view name, std::string_view type, ROOT:
      fTraits(isSimple ? kTraitMappable : 0)
 {
    ROOT::Internal::EnsureValidNameForRNTuple(name, "Field");
+   fStringPool = fgSharedStringPool ? fgSharedStringPool : std::make_shared<Internal::RStringPool>();
+   fFieldName = fStringPool->Intern(name);
+   fTypeName = fStringPool->Intern(type);
+   fTypeAlias = fStringPool->Intern("");
+   fDescription = fStringPool->Intern("");
 }
 
 std::string ROOT::RFieldBase::GetQualifiedFieldName() const
@@ -321,6 +335,10 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
 
    if (resolvedType.empty())
       return R__FORWARD_RESULT(fnFail("no type name specified for field '" + fieldName + "'"));
+
+   // Ensure that parent and child fields use the same string pool to start with. Note that if a shared string pool
+   // is already present (e.g., in a recursive call), the existing one will be used over the new one.
+   Internal::RFieldSharedStringPoolRaii stringPoolRaii;
 
    std::unique_ptr<ROOT::RFieldBase> result;
 
@@ -534,7 +552,7 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
          const auto &fieldDesc = desc->GetFieldDescriptor(fieldId);
          if (fieldDesc.GetStructure() == ENTupleStructure::kStreamer) {
             auto streamerField = std::unique_ptr<RFieldBase>(new RStreamerField(fieldName, typeName));
-            streamerField->fTypeAlias = fieldDesc.GetTypeAlias();
+            streamerField->SetTypeAlias(fieldDesc.GetTypeAlias());
             return streamerField;
          } else if (fieldDesc.GetStructure() == ENTupleStructure::kRecord) {
             std::vector<std::unique_ptr<RFieldBase>> memberFields;
@@ -546,7 +564,7 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
             }
             R__ASSERT(typeName == fieldDesc.GetTypeName());
             auto recordField = Internal::CreateEmulatedRecordField(fieldName, std::move(memberFields), fieldDesc);
-            recordField->fTypeAlias = fieldDesc.GetTypeAlias();
+            recordField->SetTypeAlias(fieldDesc.GetTypeAlias());
             return recordField;
          } else if (fieldDesc.GetStructure() == ENTupleStructure::kCollection) {
             if (fieldDesc.GetLinkIds().size() != 1)
@@ -557,7 +575,7 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
             auto itemField =
                Create(itemFieldDesc.GetFieldName(), itemFieldDesc.GetTypeName(), options, desc, itemFieldId).Unwrap();
             auto vecField = ROOT::Internal::CreateEmulatedVectorField(fieldName, std::move(itemField), fieldDesc);
-            vecField->fTypeAlias = fieldDesc.GetTypeAlias();
+            vecField->SetTypeAlias(fieldDesc.GetTypeAlias());
             return vecField;
          } else if (ROOT::Internal::IsCustomEnumFieldDesc(*desc, fieldDesc)) {
             R__ASSERT(!fieldDesc.GetLinkIds().empty());
@@ -565,7 +583,7 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
             const auto &underlyingIntFieldDesc = desc->GetFieldDescriptor(underlyingIntFieldId);
             auto enumField = ROOT::Internal::CreateEmulatedEnumField(fieldName, fieldDesc.GetTypeName(),
                                                                      underlyingIntFieldDesc.GetTypeName());
-            enumField->fTypeAlias = fieldDesc.GetTypeAlias();
+            enumField->SetTypeAlias(fieldDesc.GetTypeAlias());
             return enumField;
          }
       }
@@ -590,7 +608,7 @@ ROOT::RFieldBase::Create(const std::string &fieldName, const std::string &typeNa
    if (result) {
       const auto normOrigType = ROOT::Internal::GetNormalizedUnresolvedTypeName(typeName);
       if (normOrigType != result->GetTypeName()) {
-         result->fTypeAlias = normOrigType;
+         result->SetTypeAlias(normOrigType);
       }
       return result;
    }
@@ -606,9 +624,9 @@ const ROOT::RFieldBase::RColumnRepresentations &ROOT::RFieldBase::GetColumnRepre
 std::unique_ptr<ROOT::RFieldBase> ROOT::RFieldBase::Clone(std::string_view newName) const
 {
    auto clone = CloneImpl(newName);
-   clone->fTypeAlias = fTypeAlias;
+   clone->SetDescription(*fDescription);
+   clone->SetTypeAlias(*fTypeAlias);
    clone->fOnDiskId = fOnDiskId;
-   clone->fDescription = fDescription;
    // We can just copy the references because fColumnRepresentatives point into a static structure
    clone->fColumnRepresentatives = fColumnRepresentatives;
    return clone;
@@ -627,7 +645,7 @@ void ROOT::RFieldBase::ReadGlobalImpl(ROOT::NTupleSize_t /*index*/, void * /* to
 
 void ROOT::RFieldBase::ReadInClusterImpl(RNTupleLocalIndex localIndex, void *to)
 {
-   ReadGlobalImpl(fPrincipalColumn->GetGlobalIndex(localIndex), to);
+   ReadGlobalImpl(fPrincipalColumn->ForReading()->GetGlobalIndex(localIndex), to);
 }
 
 std::size_t ROOT::RFieldBase::ReadBulkImpl(const RBulkSpec &bulkSpec)
@@ -677,6 +695,25 @@ std::vector<ROOT::RFieldBase::RValue> ROOT::RFieldBase::SplitValue(const RValue 
    return std::vector<RValue>();
 }
 
+void ROOT::RFieldBase::SetStringPool(const std::shared_ptr<Internal::RStringPool> &pool)
+{
+   fFieldName = pool->Intern(*fFieldName);
+   fTypeName = pool->Intern(*fTypeName);
+   fTypeAlias = pool->Intern(*fTypeAlias);
+   fDescription = pool->Intern(*fDescription);
+   fStringPool = pool;
+}
+
+std::shared_ptr<ROOT::Internal::RStringPool>
+ROOT::RFieldBase::SetSharedStringPool(const std::shared_ptr<Internal::RStringPool> &pool)
+{
+   // Don't nest different shared string pools. Always use the outer-most one but allow for it to be reset to null.
+   if (fgSharedStringPool && pool) {
+      return fgSharedStringPool;
+   }
+   return std::exchange(fgSharedStringPool, pool);
+}
+
 void ROOT::RFieldBase::Attach(std::unique_ptr<ROOT::RFieldBase> child, std::string_view expectedChildName)
 {
    // Note that technically the zero field would not need to have the extensible trait: because only its sub fields
@@ -687,6 +724,13 @@ void ROOT::RFieldBase::Attach(std::unique_ptr<ROOT::RFieldBase> child, std::stri
    if (!expectedChildName.empty() && child->GetFieldName() != expectedChildName) {
       throw RException(R__FAIL(std::string("invalid subfield name: ") + child->GetFieldName() +
                                "   expected: " + std::string(expectedChildName)));
+   }
+
+   if (fStringPool != child->fStringPool) {
+      child->SetStringPool(fStringPool);
+      for (auto &f : *child) {
+         f.SetStringPool(fStringPool);
+      }
    }
 
    child->fParent = this;
@@ -733,7 +777,7 @@ void ROOT::RFieldBase::FlushColumns()
       const auto activeRepresentationIndex = fPrincipalColumn->GetRepresentationIndex();
       for (auto &column : fAvailableColumns) {
          if (column->GetRepresentationIndex() == activeRepresentationIndex) {
-            column->Flush();
+            column->ForWriting()->Flush();
          }
       }
    }
@@ -745,9 +789,9 @@ void ROOT::RFieldBase::CommitCluster()
       const auto activeRepresentationIndex = fPrincipalColumn->GetRepresentationIndex();
       for (auto &column : fAvailableColumns) {
          if (column->GetRepresentationIndex() == activeRepresentationIndex) {
-            column->Flush();
+            column->ForWriting()->Flush();
          } else {
-            column->CommitSuppressed();
+            column->ForWriting()->CommitSuppressed();
          }
       }
    }
@@ -758,7 +802,14 @@ void ROOT::RFieldBase::SetDescription(std::string_view description)
 {
    if (fState != EState::kUnconnected)
       throw RException(R__FAIL("cannot set field description once field is connected"));
-   fDescription = std::string(description);
+   fDescription = fStringPool->Intern(description);
+}
+
+void ROOT::RFieldBase::SetTypeAlias(std::string_view typeAlias)
+{
+   if (fState != EState::kUnconnected)
+      throw RException(R__FAIL("cannot set type alias once field is connected"));
+   fTypeAlias = fStringPool->Intern(typeAlias);
 }
 
 void ROOT::RFieldBase::SetOnDiskId(ROOT::DescriptorId_t id)
@@ -775,7 +826,7 @@ std::size_t ROOT::RFieldBase::Append(const void *from)
    if (~fTraits & kTraitMappable)
       return AppendImpl(from);
 
-   fPrincipalColumn->Append(from);
+   fPrincipalColumn->ForWriting()->Append(from);
    return fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -793,7 +844,7 @@ std::size_t ROOT::RFieldBase::ReadBulk(const RBulkSpec &bulkSpec)
 {
    if (fIsSimple) {
       /// For simple types, ignore the mask and memcopy the values into the destination
-      fPrincipalColumn->ReadV(bulkSpec.fFirstIndex, bulkSpec.fCount, bulkSpec.fValues);
+      fPrincipalColumn->ForReading()->ReadV(bulkSpec.fFirstIndex, bulkSpec.fCount, bulkSpec.fValues);
       std::fill(bulkSpec.fMaskAvail, bulkSpec.fMaskAvail + bulkSpec.fCount, true);
       return RBulkSpec::kAllSet;
    }
@@ -943,7 +994,7 @@ void ROOT::RFieldBase::AutoAdjustColumnTypes(const ROOT::RNTupleWriteOptions &op
    // Only adjust Double32_t when the user did not pin a representation: an explicit representative must
    // survive (see RNTupleMerger::ExtendDestinationModel), otherwise merging would silently reinterpret the
    // raw copies of the source pages under a different encoding.
-   if ((fTypeAlias == "Double32_t") && hadDefaultRepresentative) {
+   if ((*fTypeAlias == "Double32_t") && hadDefaultRepresentative) {
       if (options.GetCompression() != 0)
          SetColumnRepresentatives({{ROOT::ENTupleColumnType::kSplitReal32}});
       else
@@ -953,7 +1004,7 @@ void ROOT::RFieldBase::AutoAdjustColumnTypes(const ROOT::RNTupleWriteOptions &op
    // An explicit representation pinned on a Double32_t field must contain a reduced-precision encoding:
    // a 64-bit-only selection would store full doubles while the field promises Double32_t precision.
    // A multi-column selection that also includes a reduced-precision representative stays legal.
-   if ((fTypeAlias == "Double32_t") && !hadDefaultRepresentative) {
+   if ((*fTypeAlias == "Double32_t") && !hadDefaultRepresentative) {
       bool hasSubDoubleRep = false;
       for (const auto &rep : GetColumnRepresentatives()) {
          for (const auto colType : rep) {
@@ -987,7 +1038,7 @@ void ROOT::RFieldBase::ConnectPageSink(ROOT::Internal::RPageSink &pageSink, ROOT
       // larger column indexes are data columns of collections (string, streamer) and thus
       // they have no elements on late model extension
       auto firstElementIndex = (column->GetIndex() == 0) ? EntryToColumnElementIndex(firstEntry) : 0;
-      column->ConnectPageSink(fOnDiskId, pageSink, firstElementIndex);
+      column->ForWriting()->ConnectPageSink(fOnDiskId, pageSink, firstElementIndex);
    }
 
    if (HasExtraTypeInfo()) {
@@ -1011,7 +1062,7 @@ void ROOT::RFieldBase::ConnectPageSource(ROOT::Internal::RPageSource &pageSource
 
    if (!fColumnRepresentatives.empty())
       throw RException(R__FAIL("fixed column representative only valid when connecting to a page sink"));
-   if (!fDescription.empty())
+   if (!fDescription->empty())
       throw RException(R__FAIL("setting description only valid when connecting to a page sink"));
 
    if (!fIsArtificial) {
@@ -1083,7 +1134,7 @@ void ROOT::RFieldBase::ConnectPageSource(ROOT::Internal::RPageSource &pageSource
       }
    }
    for (auto &column : fAvailableColumns)
-      column->ConnectPageSource(fOnDiskId, pageSource);
+      column->ForReading()->ConnectPageSource(fOnDiskId, pageSource);
 
    fState = EState::kConnectedToSource;
 }

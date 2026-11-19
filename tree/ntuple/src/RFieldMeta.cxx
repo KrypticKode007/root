@@ -147,6 +147,9 @@ std::string GetTypeList(std::span<std::unique_ptr<ROOT::RFieldBase>> itemFields,
 
 std::string BuildSetTypeName(ROOT::RSetField::ESetType setType, const ROOT::RFieldBase &innerField, bool useTypeAlias)
 {
+   if (innerField.GetTypeName().empty()) {
+      throw ROOT::RException(R__FAIL("invalid untyped inner field for outer set field"));
+   }
    std::string typePrefix;
    switch (setType) {
    case ROOT::RSetField::ESetType::kSet: typePrefix = "std::set<"; break;
@@ -163,6 +166,9 @@ std::string BuildSetTypeName(ROOT::RSetField::ESetType setType, const ROOT::RFie
 
 std::string BuildMapTypeName(ROOT::RMapField::EMapType mapType, const ROOT::RFieldBase *innerField, bool useTypeAliases)
 {
+   if (innerField->GetTypeName().empty()) {
+      throw ROOT::RException(R__FAIL("invalid untyped inner field for outer map field"));
+   }
    if (const auto pairField = dynamic_cast<const ROOT::RPairField *>(innerField)) {
       std::string typePrefix;
       switch (mapType) {
@@ -403,7 +409,7 @@ ROOT::RClassField::RClassField(std::string_view fieldName, TClass *classp)
 
    std::string renormalizedAlias;
    if (Internal::NeedsMetaNameAsAlias(classp->GetName(), renormalizedAlias))
-      fTypeAlias = renormalizedAlias;
+      SetTypeAlias(renormalizedAlias);
 
    int i = 0;
    const auto *bases = fClass->GetListOfBases();
@@ -920,7 +926,7 @@ ROOT::RSoAField::RSoAField(std::string_view fieldName, TClass *clSoA)
 
    std::string renormalizedAlias;
    if (ROOT::Internal::NeedsMetaNameAsAlias(fClass->GetName(), renormalizedAlias))
-      fTypeAlias = renormalizedAlias;
+      SetTypeAlias(renormalizedAlias);
 
    fTraits |= kTraitSoACollection | kTraitTypeChecksum;
    fLockSplitFields = std::make_unique<std::mutex>();
@@ -978,7 +984,7 @@ std::size_t ROOT::RSoAField::AppendImpl(const void *from)
          auto [beginPtr, _, __] = ROOT::Internal::GetRVecDataMembers(rvecPtr);
          RFieldBase *memberField = fRecordMemberFields[i];
          if (memberField->IsSimple()) {
-            GetPrincipalColumnOf(*memberField)->AppendV(*beginPtr, N);
+            GetPrincipalColumnOf(*memberField)->ForWriting()->AppendV(*beginPtr, N);
             nbytes += N * GetPrincipalColumnOf(*memberField)->GetElement()->GetPackedSize();
          } else {
             for (std::size_t j = 0; j < N; ++j) {
@@ -989,7 +995,7 @@ std::size_t ROOT::RSoAField::AppendImpl(const void *from)
    }
 
    fNWritten += N;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return nbytes + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -998,7 +1004,7 @@ void ROOT::RSoAField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to)
    // Read collection info for this entry
    ROOT::NTupleSize_t N;
    RNTupleLocalIndex collectionStart;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &N);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &N);
 
    const auto nSoAMembers = fSoAMemberOffsets.size();
    for (std::size_t i = 0; i < nSoAMembers; ++i) {
@@ -1011,7 +1017,7 @@ void ROOT::RSoAField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *to)
          continue;
 
       if (memberField->IsSimple()) {
-         GetPrincipalColumnOf(*memberField)->ReadV(collectionStart, N, begin);
+         GetPrincipalColumnOf(*memberField)->ForReading()->ReadV(collectionStart, N, begin);
       } else {
          if (memberField->IsArtificial()) {
             // Other artificial fields simply don't read at all. This does not work here because then
@@ -1249,9 +1255,11 @@ void ROOT::REnumField::AcceptVisitor(ROOT::Detail::RFieldVisitor &visitor) const
 ROOT::RPairField::RPairField(std::string_view fieldName, std::array<std::unique_ptr<RFieldBase>, 2> itemFields)
    : ROOT::RRecordField(fieldName, "std::pair<" + GetTypeList(itemFields, false /* useTypeAliases */) + ">")
 {
+   Internal::EnsureTypedChildField(*itemFields[0], *this);
+   Internal::EnsureTypedChildField(*itemFields[1], *this);
    const std::string typeAlias = "std::pair<" + GetTypeList(itemFields, true /* useTypeAliases */) + ">";
    if (typeAlias != GetTypeName())
-      fTypeAlias = typeAlias;
+      SetTypeAlias(typeAlias);
 
    AttachItemFields(std::move(itemFields));
 
@@ -1340,7 +1348,7 @@ ROOT::RProxiedCollectionField::RProxiedCollectionField(std::string_view fieldNam
 
    std::string renormalizedAlias;
    if (Internal::NeedsMetaNameAsAlias(classp->GetName(), renormalizedAlias))
-      fTypeAlias = renormalizedAlias;
+      SetTypeAlias(renormalizedAlias);
 
    fProxy.reset(classp->GetCollectionProxy()->Generate());
    fProperties = fProxy->GetProperties();
@@ -1408,7 +1416,7 @@ std::size_t ROOT::RProxiedCollectionField::AppendImpl(const void *from)
    }
 
    fNWritten += count;
-   fPrincipalColumn->Append(&fNWritten);
+   fPrincipalColumn->ForWriting()->Append(&fNWritten);
    return nbytes + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -1416,7 +1424,7 @@ void ROOT::RProxiedCollectionField::ReadGlobalImpl(ROOT::NTupleSize_t globalInde
 {
    ROOT::NTupleSize_t nItems;
    RNTupleLocalIndex collectionStart;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nItems);
 
    TVirtualCollectionProxy::TPushPop RAII(fProxy.get(), to);
    void *obj =
@@ -1534,8 +1542,9 @@ ROOT::RMapField::RMapField(std::string_view fieldName, EMapType mapType, std::un
                              EnsureValidClass(BuildMapTypeName(mapType, itemField.get(), false /* useTypeAliases */))),
      fMapType(mapType)
 {
+   Internal::EnsureTypedChildField(*itemField, *this);
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = BuildMapTypeName(mapType, itemField.get(), true /* useTypeAliases */);
+      SetTypeAlias(BuildMapTypeName(mapType, itemField.get(), true /* useTypeAliases */));
 
    auto *itemClass = fProxy->GetValueClass();
    fItemSize = itemClass->GetClassSize();
@@ -1571,7 +1580,7 @@ ROOT::RSetField::RSetField(std::string_view fieldName, ESetType setType, std::un
      fSetType(setType)
 {
    if (!itemField->GetTypeAlias().empty())
-      fTypeAlias = BuildSetTypeName(setType, *itemField, true /* useTypeAlias */);
+      SetTypeAlias(BuildSetTypeName(setType, *itemField, true /* useTypeAlias */));
 
    fItemSize = itemField->GetValueSize();
 
@@ -1639,7 +1648,7 @@ ROOT::RStreamerField::RStreamerField(std::string_view fieldName, TClass *classp)
 
    std::string renormalizedAlias;
    if (Internal::NeedsMetaNameAsAlias(classp->GetName(), renormalizedAlias))
-      fTypeAlias = renormalizedAlias;
+      SetTypeAlias(renormalizedAlias);
 
    fTraits |= kTraitTypeChecksum;
    // For RClassField, we only check for explicit constructors and destructors and then recursively combine traits from
@@ -1664,9 +1673,9 @@ std::size_t ROOT::RStreamerField::AppendImpl(const void *from)
    fClass->Streamer(const_cast<void *>(from), buffer);
 
    auto nbytes = buffer.Length();
-   fAuxiliaryColumn->AppendV(buffer.Buffer(), buffer.Length());
+   fAuxiliaryColumn->ForWriting()->AppendV(buffer.Buffer(), buffer.Length());
    fIndex += nbytes;
-   fPrincipalColumn->Append(&fIndex);
+   fPrincipalColumn->ForWriting()->Append(&fIndex);
    return nbytes + fPrincipalColumn->GetElement()->GetPackedSize();
 }
 
@@ -1674,10 +1683,10 @@ void ROOT::RStreamerField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *
 {
    RNTupleLocalIndex collectionStart;
    ROOT::NTupleSize_t nbytes;
-   fPrincipalColumn->GetCollectionInfo(globalIndex, &collectionStart, &nbytes);
+   fPrincipalColumn->ForReading()->GetCollectionInfo(globalIndex, &collectionStart, &nbytes);
 
    TBufferFile buffer(TBuffer::kRead, nbytes);
-   fAuxiliaryColumn->ReadV(collectionStart, nbytes, buffer.Buffer());
+   fAuxiliaryColumn->ForReading()->ReadV(collectionStart, nbytes, buffer.Buffer());
    fClass->Streamer(to, buffer);
 }
 
@@ -1895,9 +1904,12 @@ void ROOT::RField<TObject>::AcceptVisitor(ROOT::Detail::RFieldVisitor &visitor) 
 ROOT::RTupleField::RTupleField(std::string_view fieldName, std::vector<std::unique_ptr<RFieldBase>> itemFields)
    : ROOT::RRecordField(fieldName, "std::tuple<" + GetTypeList(itemFields, false /* useTypeAliases */) + ">")
 {
+   for (const auto &f : itemFields) {
+      Internal::EnsureTypedChildField(*f, *this);
+   }
    const std::string typeAlias = "std::tuple<" + GetTypeList(itemFields, true /* useTypeAliases */) + ">";
    if (typeAlias != GetTypeName())
-      fTypeAlias = typeAlias;
+      SetTypeAlias(typeAlias);
 
    AttachItemFields(std::move(itemFields));
 
@@ -1987,12 +1999,15 @@ ROOT::RVariantField::RVariantField(std::string_view fieldName, std::vector<std::
    : ROOT::RFieldBase(fieldName, "std::variant<" + GetTypeList(itemFields, false /* useTypeAliases */) + ">",
                       ROOT::ENTupleStructure::kVariant, false /* isSimple */)
 {
+   for (const auto &f : itemFields) {
+      Internal::EnsureTypedChildField(*f, *this);
+   }
    // The variant needs to initialize its own tag member
    fTraits |= kTraitTriviallyDestructible & ~kTraitTriviallyConstructible;
 
    const std::string typeAlias = "std::variant<" + GetTypeList(itemFields, true /* useTypeAliases */) + ">";
    if (typeAlias != GetTypeName())
-      fTypeAlias = typeAlias;
+      SetTypeAlias(typeAlias);
 
    auto nFields = itemFields.size();
    if (nFields == 0 || nFields > kMaxVariants) {
@@ -2048,7 +2063,7 @@ std::size_t ROOT::RVariantField::AppendImpl(const void *from)
       index = fNWritten[tag - 1]++;
    }
    ROOT::Internal::RColumnSwitch varSwitch(index, tag);
-   fPrincipalColumn->Append(&varSwitch);
+   fPrincipalColumn->ForWriting()->Append(&varSwitch);
    return nbytes + sizeof(ROOT::Internal::RColumnSwitch);
 }
 
@@ -2056,7 +2071,7 @@ void ROOT::RVariantField::ReadGlobalImpl(ROOT::NTupleSize_t globalIndex, void *t
 {
    RNTupleLocalIndex variantIndex;
    std::uint32_t tag;
-   fPrincipalColumn->GetSwitchInfo(globalIndex, &variantIndex, &tag);
+   fPrincipalColumn->ForReading()->GetSwitchInfo(globalIndex, &variantIndex, &tag);
    R__ASSERT(tag < 256);
 
    // If `tag` equals 0, the variant is in the invalid state, i.e, it does not hold any of the valid alternatives in
